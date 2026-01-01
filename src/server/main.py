@@ -5,9 +5,7 @@ from src.core.config import settings
 from loguru import logger
 from src.core.logging import setup_logging
 from src.engine.pipeline import VisionPipeline
-import threading
 import uvicorn
-import cv2
 
 # 1. Setup Logging
 setup_logging()

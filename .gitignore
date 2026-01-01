@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+
+# Configuration (Secrets)
+.env
+config.yaml
+
+# Data & Models (Too big for Git)
+models/*.onnx
+models/*.pt
+models/*.bin
+models/*.xml
+data/
+logs/
+
+# IDEs
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# --- IGNORE DATA ---
+data/
+*.mp4
+*.avi
+*.jpg
+*.png
+*.zip
+0_DELETE_MYOWNUNDERSTANDING.txt
+yolov8n.pt

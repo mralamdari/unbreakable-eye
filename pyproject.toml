@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "unbreakable-eye"
+version = "0.1.0"
+description = "Edge AI Pipeline"
+authors = ["Esmaeil.F.A <mralamdari2000@gmail.com>"]
+
+# --- THIS WAS MISSING. IT TELLS POETRY WHERE YOUR CODE IS ---
+packages = [
+    { include = "src" }
+]
+# ------------------------------------------------------------
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+# --- CORE ---
+fastapi = "^0.109.0"
+uvicorn = "^0.27.0"
+pydantic = "^2.6.0"
+pydantic-settings = "^2.2.0"
+loguru = "^0.7.2"
+
+# --- VISION & AI ---
+opencv-python-headless = "^4.9.0"
+supervision = "^0.27.0"      
+ultralytics = "^8.1.0"       # Needed for YOLOv8
+onnxruntime = "^1.17.0"      # Needed for YOLOX/RT-DETR (CPU version)
+# onnxruntime-gpu = "^1.17.0" # Use THIS instead of onnxruntime if you have NVIDIA GPU
+
+# --- OPENVINO (Optional) ---
+openvino = "2023.3.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+ruff = "^0.2.0"
+mypy = "^1.8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

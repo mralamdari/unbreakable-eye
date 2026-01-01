@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  eye-node:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+    image: unbreakable-eye:latest
+    container_name: eye_v1
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override config here for deployment
+      - RTSP_URL=${RTSP_URL}
+      - CONFIDENCE=0.6

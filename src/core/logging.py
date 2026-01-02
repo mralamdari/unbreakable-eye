@@ -17,8 +17,6 @@ class InterceptHandler(logging.Handler):
             # FIX: Convert levelno to its string name for consistency
             level = record.levelname # Use the string name, not the number
         
-        # ... (rest of the code for frame handling) ...
-
         _current_frame: FrameType | None = logging.currentframe()
         depth = 2
 

@@ -2,6 +2,7 @@ import sys
 import logging
 from loguru import logger
 from src.core.config import settings
+from types import FrameType
 
 class InterceptHandler(logging.Handler):
     """
@@ -13,17 +14,27 @@ class InterceptHandler(logging.Handler):
         try:
             level = logger.level(record.levelname).name
         except ValueError:
-            level = record.levelno
+            # FIX: Convert levelno to its string name for consistency
+            level = record.levelname # Use the string name, not the number
+        
+        # ... (rest of the code for frame handling) ...
 
-        # Find caller from where originated the logged message
-        frame, depth = logging.currentframe(), 2
-        while frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
+        _current_frame: FrameType | None = logging.currentframe()
+        depth = 2
+
+        if _current_frame is not None:
+            _iter_frame: FrameType = _current_frame
+            while _iter_frame.f_code.co_filename == logging.__file__:
+                _iter_frame = _iter_frame.f_back # type: ignore[assignment]
+                depth += 1
+                if _iter_frame is None:
+                    break
 
         logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
+            level, # This 'level' variable must be a string
+            record.getMessage()
         )
+        
 def setup_logging():
     """
     Configures the logging system. Call this once at startup.

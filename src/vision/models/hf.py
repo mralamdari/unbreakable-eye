@@ -49,7 +49,7 @@ class HFTransformerDetector(BaseDetector):
         resized_img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
 
         # 3. Canvas (Padding) - Use 0 or 114 depending on model training
-        canvas = np.full((self.input_h, self.input_w, 3), 0, dtype=np.float32)
+        canvas = np.full((self.input_h, self.input_w, 3), 0, dtype=np.float32)  # type: ignore [assignment]
         canvas[:new_unpad[1], :new_unpad[0]] = resized_img
 
         # 4. Normalize
@@ -59,7 +59,9 @@ class HFTransformerDetector(BaseDetector):
 
         # 5. HWC -> CHW -> Batch
         canvas = canvas.transpose((2, 0, 1))
-        canvas = np.expand_dims(canvas, axis=0)
+        
+        # Fix: MyPy sees np.full returning generic ndarray, expects specific type
+        canvas = np.expand_dims(canvas, axis=0) # type: ignore [assignment]
 
         return np.ascontiguousarray(canvas, dtype=np.float32), r
 

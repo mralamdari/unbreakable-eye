@@ -22,7 +22,7 @@ loguru = "^0.7.2"
 
 # --- VISION & AI ---
 opencv-python-headless = "^4.9.0"
-supervision = "^0.27.0"      
+supervision = "^0.27.0"
 ultralytics = "^8.1.0"       # Needed for YOLOv8
 onnxruntime = "^1.17.0"      # Needed for YOLOX/RT-DETR (CPU version)
 # onnxruntime-gpu = "^1.17.0" # Use THIS instead of onnxruntime if you have NVIDIA GPU
@@ -38,3 +38,29 @@ mypy = "^1.8.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+# --- NEW SECTION: MYPY CONFIGURATION ---
+# This fixes the "Cannot find implementation or library stub" errors
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+# THIS IS THE FIX: Stop checking inside numpy/cv2/etc
+follow_imports = "silent"
+# Explicitly exclude virtual environment just in case
+exclude = ["venv", ".venv", "__pycache__"]
+
+# Explicitly ignore libraries that are known to have missing types
+
+[[tool.mypy.overrides]]
+module = [
+    "cv2.*",
+    "supervision.*",
+    "loguru.*",
+    "onnxruntime.*",
+    "ultralytics.*",
+    "openvino.*",
+    "fastapi.*",
+    "uvicorn.*"
+]
+ignore_missing_imports = true

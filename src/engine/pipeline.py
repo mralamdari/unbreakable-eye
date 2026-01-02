@@ -44,12 +44,15 @@ class VisionPipeline:
         detections = self.tracker.update_with_detections(detections)
         
         # 3. Annotation
+        labels = []
         annotated_frame = frame.copy()
-        
-        labels = [
-            f"#{tracker_id} {conf:.2f}" 
-            for tracker_id, conf in zip(detections.tracker_id, detections.confidence)
-        ]
+        if detections.tracker_id is not None and detections.confidence is not None \
+           and len(detections.tracker_id) == len(detections.confidence): # Check lengths match
+        # if detections.tracker_id is not None:
+            labels = [
+                f"#{tracker_id} {conf:.2f}" 
+                for tracker_id, conf in zip(detections.tracker_id, detections.confidence)
+            ]
 
         annotated_frame = self.trace_annotator.annotate(annotated_frame, detections)
         annotated_frame = self.box_annotator.annotate(annotated_frame, detections)

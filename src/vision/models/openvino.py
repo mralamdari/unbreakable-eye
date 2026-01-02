@@ -1,27 +1,38 @@
 import cv2
 import numpy as np
 import supervision as sv
-from openvino import Core
+# from openvino import Core
 from src.vision.base import BaseDetector
+from openvino.runtime import Core
 
 
 class OpenVinoDetector(BaseDetector):
     def __init__(self, model_path: str, conf_thresh: float, device: str):
-        self.device = device
         self.confidence_threshold = conf_thresh
         
-        self.load_model(model_path)
+        # ie = Core() # type: ignore [has-type]
+        # self.model = ie.compile_model(model=model_path, device_name=device) # type: ignore [has-type]
         
+        core = Core()
+        # MyPy cannot determine type of "model" from core.read_model
+        model = core.read_model(model=model_path) # type: ignore[has-type]
+        # MyPy cannot determine type of "compiled_model"
+        self.model = core.compile_model(model=model, device_name=device) # type: ignore[has-type]
+        
+        self.infer_request = self.model.create_infer_request()
         self.input_layer = self.model.input(0)
         self.output_layer = self.model.output(0)
-        self.input_h = self.input_layer.shape[2]
-        self.input_w = self.input_layer.shape[3]
+        
+        shape = self.input_layer.shape
+        self.input_h = shape[2] if isinstance(shape[2], int) else 640
+        self.input_w = shape[3] if isinstance(shape[3], int) else 640
+        
+        # self.input_layer = self.model.input(0)
+        # self.output_layer = self.model.output(0)
+        # self.input_h = self.input_layer.shape[2]
+        # self.input_w = self.input_layer.shape[3]
 
-    def load_model(self, xml_path: str):
-        ie = Core()
-        self.model = ie.compile_model(model=xml_path, device_name=self.device)
-
-    
+        
     def preprocess(self, img: np.ndarray, img_h: int, img_w: int):
         # 1. Convert BGR to RGB (Critical for Transformers)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -49,7 +60,8 @@ class OpenVinoDetector(BaseDetector):
 
         # 5. Transpose to CHW and Add Batch Dimension
         canvas = canvas.transpose((2, 0, 1)) # HWC -> CHW
-        canvas = np.expand_dims(canvas, axis=0) # Add batch dim -> (1, 3, 640, 640)
+        # Add batch dim -> (1, 3, 640, 640)
+        canvas = np.expand_dims(canvas, axis=0) # type: ignore [assignment]
         
         # Ensure contiguous memory for ONNX Runtime
         return np.ascontiguousarray(canvas, dtype=np.float32), r

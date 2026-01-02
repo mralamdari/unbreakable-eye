@@ -47,6 +47,8 @@ class YoloXDetector(BaseDetector):
         self.expanded_strides = np.concatenate(self.expanded_strides, 1)
 
     def preprocess(self, img: np.ndarray):
+    # def preprocess(self, img: np.ndarray)-> np.ndarray:
+        
         # 1. Letterbox Resize
         img_h, img_w = img.shape[:2]
         r = min(self.input_h / img_h, self.input_w / img_w)
@@ -56,12 +58,12 @@ class YoloXDetector(BaseDetector):
         resized_img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR).astype(np.uint8)
 
         # Pad with 114 (Grey)
-        padded_img = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
+        padded_img = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8) # type: ignore [assignment]
         padded_img[:new_unpad[1], :new_unpad[0]] = resized_img
 
         # 2. HWC -> CHW and BGR (YOLOX uses BGR, no swap needed usually)
         blob = padded_img.transpose((2, 0, 1))
-        blob = np.ascontiguousarray(blob, dtype=np.float32)
+        blob = np.ascontiguousarray(blob, dtype=np.float32) # type: ignore [assignment]
         return blob, r
 
     def postprocess(self, outputs: np.ndarray, ratio: float) -> sv.Detections:
@@ -126,8 +128,13 @@ class YoloXDetector(BaseDetector):
         if len(indices) == 0:
             return sv.Detections.empty()
 
-        # OpenCV returns a weird tuple structure, flatten it
-        indices = indices.flatten()
+        # # OpenCV returns a weird tuple structure, flatten it
+        # indices = np.array(indices, dtype=int).flatten() 
+        
+        # Ensure indices is a 1D numpy array of integers for sv.Detections
+        # MyPy can be pedantic about the exact type of flattened array assigned to Sequence[int]
+        indices = np.array(indices, dtype=int).flatten() # type: ignore[assignment]
+
 
         return sv.Detections(
             xyxy=boxes_xyxy[indices],
@@ -136,7 +143,7 @@ class YoloXDetector(BaseDetector):
         )
 
     def predict(self, frame: np.ndarray) -> sv.Detections:
-        img_h, img_w = frame.shape[:2]
+        # img_h, img_w = frame.shape[:2]
         
         # Preprocess
         blob, ratio = self.preprocess(frame)

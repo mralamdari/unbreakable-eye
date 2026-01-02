@@ -18,24 +18,34 @@ def get_detector():
     logger.info(f"🏭 Factory Request: Arch={arch}, Device={device}")
     logger.debug(f"📂 Loading Model from: {path}")
     
-    # Common args
-    kwargs = {"model_path": path, "conf_thresh": conf}
     try:
         if arch == "yolox":
             return YoloXDetector(
-                **kwargs,
-                nms_thresh=settings.NMS_THRESHOLD,
-                class_agnostic=settings.CLASS_AGNOSTIC
-            )
+            model_path=path, 
+            conf_thresh=conf,
+            nms_thresh=settings.NMS_THRESHOLD,
+            class_agnostic=settings.CLASS_AGNOSTIC
+        )
         
         elif arch in ["rtdetr", "dfine"]:
-            return HFTransformerDetector(**kwargs)
+            return HFTransformerDetector(
+            model_path=path, 
+            conf_thresh=conf
+        )
         
         elif arch == "openvino":
-            return OpenVinoDetector(**kwargs, device=device)
+            return OpenVinoDetector(
+            model_path=path, 
+            conf_thresh=conf, 
+            device=device
+        )
 
         elif 'yolo' in arch:
-            return UltralyticsDetector(**kwargs, device=device)
+            return UltralyticsDetector(
+            model_path=path, 
+            conf_thresh=conf, 
+            device=device
+        )
         
         else:
             raise ValueError(f"Unknown Architecture: {arch}")

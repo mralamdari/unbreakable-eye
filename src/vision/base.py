@@ -3,10 +3,6 @@ import numpy as np
 import supervision as sv
 
 class BaseDetector(abc.ABC):
-    @abc.abstractmethod
-    def load_model(self, model_path: str):
-        """Load weights/session here"""
-        pass
 
     @abc.abstractmethod
     def predict(self, frame: np.ndarray) -> sv.Detections:

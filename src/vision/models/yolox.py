@@ -107,11 +107,6 @@ class YoloXDetector(BaseDetector):
         
         # 5. Rescale to Original Image
         boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1) / ratio
-
-        # 6. NMS (The Optimized C++ Way)
-        # cv2.dnn.NMSBoxes(boxes, scores, score_threshold, nms_threshold)
-        # We need to pass [x, y, w, h] to OpenCV NMS, not xyxy
-        # But we already have xyxy. Let's use supervision or just standard cv2 logic.
         
         # Converting to list for OpenCV NMS
         # box format for cv2 NMS is [x, y, w, h]

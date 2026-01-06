@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import supervision as sv
+from src.core.config import settings
 from src.vision.base import BaseDetector
 from src.core.config import settings
 
@@ -10,7 +11,7 @@ class YoloXDetector(BaseDetector):
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
         self.class_agnostic = class_agnostic
-
+        
         # 1. Load Model with Priority
         if settings.DEVICE == "CUDA":
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']

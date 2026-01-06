@@ -14,10 +14,7 @@ venv/
 config.yaml
 
 # Data & Models (Too big for Git)
-models/*.onnx
-models/*.pt
-models/*.bin
-models/*.xml
+models/
 data/
 logs/
 
@@ -38,4 +35,3 @@ data/
 *.png
 *.zip
 0_DELETE_MYOWNUNDERSTANDING.txt
-yolov8n.pt

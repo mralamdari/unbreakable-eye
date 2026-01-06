@@ -48,7 +48,6 @@ class VisionPipeline:
         annotated_frame = frame.copy()
         if detections.tracker_id is not None and detections.confidence is not None \
            and len(detections.tracker_id) == len(detections.confidence): # Check lengths match
-        # if detections.tracker_id is not None:
             labels = [
                 f"#{tracker_id} {conf:.2f}" 
                 for tracker_id, conf in zip(detections.tracker_id, detections.confidence)

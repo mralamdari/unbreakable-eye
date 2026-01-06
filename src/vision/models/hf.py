@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import onnxruntime as ort
+from src.core.config import settings
 import supervision as sv
 from src.vision.base import BaseDetector
 from src.core.config import settings
@@ -15,7 +16,7 @@ class HFTransformerDetector(BaseDetector):
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         else:
             providers = ['CPUExecutionProvider']
-            
+        
         print(f"Loading RT-DETR/DFine from {model_path} on {providers[0]}...")
         self.session = ort.InferenceSession(model_path, providers=providers)
         

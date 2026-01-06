@@ -40,7 +40,7 @@ app = FastAPI(title=settings.PROJECT_NAME, lifespan=lifespan)
 def health_check():
     return {
         "status": "online",
-        "model": settings.MODEL_ARCH,
+        "model": settings.MODEL_ID,
         "device": settings.DEVICE
     }
 

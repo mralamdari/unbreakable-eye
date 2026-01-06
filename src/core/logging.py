@@ -72,7 +72,8 @@ def setup_logging():
         "logs/app.log",
         rotation="10 MB",
         retention="1 week",
-        level="WARNING",  # Only save warnings/errors to disk
+        # level="WARNING",  # Only save warnings/errors to disk
+        level="DEBUG",  # "DEBUG" save everything on disk
         compression="zip"
     )
 

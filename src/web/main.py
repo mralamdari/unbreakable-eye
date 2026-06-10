@@ -400,8 +400,8 @@ async def lifespan(app: FastAPI):
 setup_logging()
 BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app       = FastAPI(lifespan=lifespan, title="ShopVision API", version="2.0.0")
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "server", "templates"))
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "server", "static")), name="static")
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "web", "templates"))
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "web", "static")), name="static")
 
 
 # ---------------------------------------------------------------------------

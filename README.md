@@ -71,7 +71,7 @@ Control the pipeline via Environment Variables (`.env`). No code changes require
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `RTSP_URL` | `0` | Camera URL (rtsp://...) or Webcam ID |
-| `MODEL_ARCH` | `yolov8` | Engine to use: `yolov8`, `yolox`, `rtdetr`, `openvino` |
+| `MODEL_ARCH` | `yolov8` | Engine to use: `yolov8`, `yolox`, `rfdetr`, `openvino` |
 | `DEVICE` | `cpu` | Hardware accelerator: `cpu`, `cuda`, `gpu` |
 | `LOG_JSON` | `False` | Set `True` for production JSON logs |
 

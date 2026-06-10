@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     NMS_THRESHOLD: float = 0.4  #0.5  YOLO’s NMS is too aggressive. The box that remains after NMS covers both people, so the second never gets its own ID.
     
     CLASS_AGNOSTIC: bool = True # YOLOX specific
-    # --- SERVER ---
+    # --- WEB ---
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 

@@ -1,0 +1,197 @@
+/* static/styles.css */
+:root {
+  --bg: #0c0f13; --fg: #e8eaed; --muted: #9aa0a6; --accent: #4f8cff; --card: #171a21;
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, Arial, sans-serif; }
+.header { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid #222; }
+.brand { font-weight:700; }
+.nav a { margin-left:12px; color:var(--fg); text-decoration:none; }
+.container { padding:16px; max-width:1100px; margin:0 auto; }
+.footer { padding:16px; text-align:center; color:var(--muted); border-top:1px solid #222; margin-top:24px; }
+.flash { margin:8px 0; }
+.flash-item { padding:8px; border-radius:6px; margin-bottom:6px; background:#203040; }
+.flash-item.success { background:#1f3b2e; }
+.flash-item.danger { background:#3b1f1f; }
+.flash-success { background: #28a745; }
+.flash-danger  { background: #dc3545; }
+.flash-warning { background: #ffc107; color: #000; }
+.flash-info    { background: #17a2b8; }
+.flash-bar {
+    padding: 12px 20px;
+    margin: 0 10px;
+    border-radius: 4px;
+    color: #fff;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.flash-success { background: #28a745; }
+.flash-danger  { background: #dc3545; }
+.flash-warning { background: #ffc107; color: #000; }
+.flash-info    { background: #17a2b8; }
+
+.flash-close {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 1.2em;
+    cursor: pointer;
+    margin-left: 10px;
+}
+.hero h1 { margin-bottom:8px; }
+.cta .button { margin-right:8px; }
+.button-danger { background: #c00; color: white; border: none; padding: 6px 12px; cursor: pointer; }
+.button { background:var(--accent); color:#fff; border:none; padding:10px 16px; border-radius:8px; cursor:pointer; text-decoration:none; display:inline-block; }
+.button.outline { background:transparent; border:1px solid var(--accent); color:var(--accent); }
+.features { display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; margin-top:16px; }
+.feature { background:var(--card); padding:12px; border-radius:10px; border:1px solid #222; }
+.form { display:grid; gap:10px; max-width:480px; }
+.cards { display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; }
+.card { background:var(--card); border:1px solid #222; border-radius:10px; padding:12px; }
+.card-title { font-weight:600; margin-bottom:6px; }
+.grid { display:grid; gap:8px; grid-template-columns:repeat(3, 1fr); }
+.tile { background:var(--card); border:1px solid #222; border-radius:10px; min-height:200px; position:relative; overflow:hidden; cursor:pointer; }
+.tile-header { position:absolute; top:8px; left:8px; display:flex; gap:8px; align-items:center; }
+.badge { background:#333; color:#ddd; padding:4px 8px; border-radius:999px; font-size:12px; }
+.name { font-weight:600; }
+
+
+/* .placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); } */
+
+
+.placeholder {
+  width: 100%;
+  height: 100%;
+  background: #222;
+  color: #aaa;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-style: italic;
+}
+
+
+
+
+
+/* Baseline: full page, no horizontal overflow */
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow-x: hidden;
+}
+
+/* Video wall container */
+.video-wall {
+  display: grid;
+  height: 100vh;
+  width: 100%;
+  gap: 8px;
+  background: #000;
+}
+
+/* Camera tiles */
+.tile {
+  position: relative;
+  background: #000;
+  color: #fff;
+  border-radius: 8px;
+  overflow: hidden;           /* clip media to tile bounds */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tile img,
+.tile video,
+.tile .placeholder {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;          /* fill by default (may crop) */
+  display: block;
+}
+
+/* --- Zoomed state: big first row + thumbnails row --- */
+.video-wall:has(.tile.zoom) {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-rows: 70vh auto; /* first row tall, second row auto */
+  grid-auto-flow: row;           /* stack rows, not columns */
+}
+
+/* Zoomed tile: span all columns in the first row */
+.tile.zoom {
+  grid-column: 1 / -1;  /* span across all columns */
+  grid-row: 1;
+  height: 70vh;
+  z-index: 10;
+}
+
+/* Keep the entire frame visible when zoomed (no spill) */
+.tile.zoom img,
+.tile.zoom video,
+.tile.zoom .placeholder {
+  object-fit: contain;
+}
+
+/* Non-zoom tiles become thumbnails in row 2 and line up horizontally */
+.video-wall:has(.tile.zoom) .tile:not(.zoom) {
+  grid-row: 2;                 /* second row */
+  height: 20vh;                /* thumbnail height */
+}
+
+/* Optional: nicer scrollbars for the thumbnail strip */
+.video-wall:has(.tile.zoom)::-webkit-scrollbar {
+  height: 8px;
+}
+.video-wall:has(.tile.zoom)::-webkit-scrollbar-track {
+  background: #111;
+}
+.video-wall:has(.tile.zoom)::-webkit-scrollbar-thumb {
+  background: #444;
+  border-radius: 4px;
+}
+
+/* --- Stable layouts when NOT zoomed --- */
+
+/* 1 camera → full screen */
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(1):last-child) {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+
+/* 2 cameras → split screen */
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(2):last-child) {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr;
+}
+
+/* 3 or 4 cameras → 2×2 grid */
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(3):last-child),
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(4):last-child) {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+/* 5–9 cameras → 3×3 grid */
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(5):last-child),
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(6):last-child),
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(7):last-child),
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(8):last-child),
+.video-wall:not(:has(.tile.zoom)):has(.tile:nth-child(9):last-child) {
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+}
+
+/* Media safety: never exceed the tile */
+img, video {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
+
+
+
+img { width:100%; height:100%; object-fit:cover; display:block; }
+@media (max-width:800px){ .features, .cards, .grid { grid-template-columns:1fr; } }

@@ -1,22 +1,39 @@
 # Python
 __pycache__/
+*.py[cod]
 *.pyc
 *.pyo
 *.pyd
 .Python
+
+# Environment
+.env
+*.env
 env/
 venv/
 .venv/
 *.egg-info/
+.ruff_cache/
+.hf_cache/
 
 # Configuration (Secrets)
-.env
 config.yaml
 
+# Model weights — never commit binary model files
 # Data & Models (Too big for Git)
+models/**/*.onnx
+models/**/*.pt
+models/**/*.pth
+models/**/*.bin
 models/
 data/
 logs/
+
+# Database
+*.db
+*.sqlite3
+instance/
+
 
 # IDEs
 .vscode/
@@ -26,6 +43,17 @@ logs/
 .pytest_cache/
 .mypy_cache/
 .coverage
+
+# Data and debug artifacts
+data/
+logs/
+*.txt
+
+
+# OS
+.DS_Store
+Thumbs.db
+
 
 # --- IGNORE DATA ---
 data/

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{{ title or "Shop Vision" }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="/static/styles.css" rel="stylesheet">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+</head>
+<body>
+    <header class="header">
+        <div class="brand">Shop Vision</div>
+        <nav class="nav">
+            <a href="/">Home</a>
+            <a href="/about">About</a>
+            {% if logged_in %}
+                <a href="/register">Cameras</a>
+                <a href="/monitor">Monitor</a>
+                <a href="/analysis">Analysis</a>
+                <a href="/logout">Logout</a>
+            {% else %}
+                <a href="/register_user">Register</a>
+                <a href="/login">Login</a>
+            {% endif %}
+        </nav>
+    </header>
+
+    <!-- Single flash message display (shown only if flash_message exists) -->
+    {% if flash_message %}
+    <div class="flash-bar flash-{{ flash_message.category }}">
+        <span class="flash-text">{{ flash_message.message }}</span>
+    </div>
+    {% endif %}
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">© 2026 Shop Vision</footer>
+</body>
+</html>

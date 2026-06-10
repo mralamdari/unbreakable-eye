@@ -17,7 +17,9 @@ class OpenVinoDetector(BaseDetector):
         # MyPy cannot determine type of "model" from core.read_model
         model = core.read_model(model=model_path) # type: ignore[has-type]
         # MyPy cannot determine type of "compiled_model"
-        self.model = core.compile_model(model=model, device_name=device) # type: ignore[has-type]
+        # print(type(device), device)
+        # print(device.upper())
+        self.model = core.compile_model(model=model,device_name=device) # type: ignore[has-type]
         
         self.infer_request = self.model.create_infer_request()
         self.input_layer = self.model.input(0)

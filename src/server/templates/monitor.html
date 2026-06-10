@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Monitor cameras</h2>
+<p>Click a tile to zoom; layout adapts to fill the screen.</p>
+
+<div class="video-wall layout-{{ cameras|length }}">
+  {% for cam in cameras %}
+  <div class="tile" onclick="zoomExclusive(this)">
+    <div class="tile-header">
+      <span class="badge">ID {{ cam.id }}</span>
+      <span class="name">{{ cam.name }}</span>
+    </div>
+    <img src="/video_feed/{{ cam.id }}" alt="{{ cam.name }}" style="width: 100%; height: auto; object-fit: cover;"/>
+  </div>
+  {% endfor %}
+
+  {# Pad with empty tiles to complete the grid #}
+  {% set count = cameras|length %}
+  {% if count not in [1,2,4,6,9,12,15,18,21] %}
+  <div class="tile empty"></div>
+  {% endif %}
+</div>
+
+<script>
+function zoomExclusive(clickedTile) {
+  const tiles = document.querySelectorAll('.tile');
+  tiles.forEach(tile => {
+    if (tile === clickedTile) {
+      tile.classList.toggle('zoom');
+    } else {
+      tile.classList.remove('zoom');
+    }
+  });
+}
+</script>
+{% endblock %}

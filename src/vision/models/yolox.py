@@ -146,6 +146,6 @@ class YoloXDetector(BaseDetector):
         
         # Inference
         outputs = self.session.run(None, {self.input_name: blob[None, :, :, :]})
-        
+        print(55555555555555, outputs[0].shape)
         # Postprocess
         return self.postprocess(outputs[0], ratio)

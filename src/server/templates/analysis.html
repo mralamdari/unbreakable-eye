@@ -1,0 +1,80 @@
+<!-- templates/analysis.html -->
+{% extends "base.html" %}
+{% block content %}
+<h2>Analytics Dashboard</h2>
+
+<!-- Overview -->
+<div class="card">
+  <h3>Overview</h3>
+  <p>Total unique customers: <span id="total-customers">--</span></p>
+  <p>Total detections: <span id="total-detections">--</span></p>
+  <p>Active now: <span id="active-now">--</span></p>
+</div>
+
+<!-- Footfall chart -->
+<canvas id="footfallChart" width="400" height="200"></canvas>
+
+<!-- Occupancy chart -->
+<canvas id="occupancyChart" width="400" height="200"></canvas>
+
+<!-- Dwell time histogram -->
+<div id="dwellChart" style="width:400px; height:200px;">
+  <!-- placeholder, can use a bar chart -->
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+async function loadData() {
+  // Overview
+  const over = await fetch('/api/analysis/overview').then(r=>r.json());
+  document.getElementById('total-customers').textContent = over.total_customers;
+  document.getElementById('total-detections').textContent = over.total_detections;
+  document.getElementById('active-now').textContent = over.active_now;
+
+  // Footfall
+  const foot = await fetch('/api/analysis/footfall?interval=day').then(r=>r.json());
+  new Chart(document.getElementById('footfallChart'), {
+    type: 'line',
+    data: {
+      labels: foot.map(d=>d.bucket),
+      datasets: [{
+        label: 'Detections per Day',
+        data: foot.map(d=>d.count),
+        borderColor: 'blue'
+      }]
+    }
+  });
+
+  // Occupancy
+  const occ = await fetch('/api/analysis/occupancy').then(r=>r.json());
+  new Chart(document.getElementById('occupancyChart'), {
+    type: 'line',
+    data: {
+      labels: occ.map(d=>d.time),
+      datasets: [{
+        label: 'Occupancy (distinct people)',
+        data: occ.map(d=>d.occupancy),
+        borderColor: 'green'
+      }]
+    }
+  });
+
+  // Dwell histogram (simple bar)
+  const dwell = await fetch('/api/analysis/dwell').then(r=>r.json());
+  const ctx = document.createElement('canvas');
+  document.getElementById('dwellChart').appendChild(ctx);
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: Object.keys(dwell),
+      datasets: [{
+        label: 'Visit Duration',
+        data: Object.values(dwell),
+        backgroundColor: 'orange'
+      }]
+    }
+  });
+}
+loadData();
+</script>
+{% endblock %}

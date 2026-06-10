@@ -1,0 +1,26 @@
+<!-- templates/home.html -->
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <h1>Realtime people detection for shops</h1>
+  <p>Register your CCTV cameras, monitor live streams, and review analytics — all on a simple laptop.</p>
+  <div class="cta">
+    <a class="button" href="/register">Manage Cameras</a>
+    <a class="button outline" href="/monitor">Monitor</a>
+  </div>
+</section>
+<section class="features">
+  <div class="feature">
+    <h3>Secure login</h3>
+    <p>Each client has unique credentials with local storage — no cloud dependency.</p>
+  </div>
+  <div class="feature">
+    <h3>Live monitoring</h3>
+    <p>Adaptive grid layout that scales from 1 to 9 cameras with zoom-on-click.</p>
+  </div>
+  <div class="feature">
+    <h3>Actionable analytics</h3>
+    <p>Daily insights: visitor counts, dwell time, peak hours, and more.</p>
+  </div>
+</section>
+{% endblock %}

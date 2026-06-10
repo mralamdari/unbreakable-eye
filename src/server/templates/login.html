@@ -1,0 +1,10 @@
+<!-- templates/login.html -->
+{% extends "base.html" %}
+{% block content %}
+<h2>Login</h2>
+<form method="post" class="form">
+  <label>Username <input type="text" name="username" required></label>
+  <label>Password <input type="password" name="password" required></label>
+  <button type="submit" class="button">Log in</button>
+</form>
+{% endblock %}

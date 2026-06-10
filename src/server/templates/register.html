@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Register cameras</h2>
+<form method="post" class="form">
+  <label>Camera name <input type="text" name="name" placeholder="Entrance" required></label>
+  <label>Camera URL <input type="text" name="url" placeholder="rtsp://user:pass@ip:554/stream" required></label>
+  <button type="submit" class="button">Add camera</button>
+</form>
+
+<h3>Registered cameras</h3>
+<div class="cards">
+  {% for cam in cameras %}
+    <div class="card">
+      <div class="card-title">{{ cam.name }}</div>
+      <div class="card-body">
+        <p><strong>ID:</strong> {{ cam.id }}</p>
+        <p><strong>URL:</strong> {{ cam.url }}</p>
+        <form method="post" action="/delete-camera/{{ cam.id }}" style="display:inline;">
+          <button type="submit" class="button button-danger">Delete</button>
+        </form>
+      </div>
+    </div>
+  {% else %}
+    <p>No cameras registered yet.</p>
+  {% endfor %}
+</div>
+{% endblock %}

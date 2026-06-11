@@ -5,12 +5,11 @@ import queue
 import psutil
 import numpy as np
 import supervision as sv
-import onnxruntime as ort
 from loguru import logger
-from datetime import datetime
 from collections import defaultdict
 from src.core.config import settings
 from src.vision.factory import get_detector
+from src.vision.utils import create_session, preprocess_crop
 from src.core.database import  fast_min_dist_to_customer
 from multiprocessing import shared_memory
 
@@ -21,21 +20,6 @@ def pin_process(cores):
         psutil.Process(os.getpid()).cpu_affinity(list(cores))
     except Exception:
         pass
-
-def create_session(model_path, num_threads=2):
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.enable_mem_pattern = True
-    sess_options.enable_cpu_mem_arena = True
-    sess_options.intra_op_num_threads = num_threads
-    sess_options.inter_op_num_threads = 2
-    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
-    available = ort.get_available_providers()
-    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
-    return ort.InferenceSession(model_path, 
-                                sess_options=sess_options,
-                                providers=providers)
     
 def frame_view(shm: shared_memory.SharedMemory, frame_shape, frame_bytes: int, idx: int):
     offset = idx * frame_bytes
@@ -48,23 +32,6 @@ def _write_frame_to_slot(shm, idx, frame, frame_shape, frame_bytes):
         frame = cv2.resize(frame, (frame_shape[1], frame_shape[0]))
     np.copyto(dst, frame)
 
-def preprocess_crop(frame, bbox, model_input_size, torso_ratio=1.0):
-    x1, y1, x2, y2 = map(int, bbox)
-    w, h = x2 - x1, y2 - y1
-    cx, cy = (x1+x2)/2, (y1+y2)/2 
-    crop_y2 = int(y1 + h * torso_ratio)
-    crop = frame[y1:crop_y2, x1:x2]
-    flag =  (crop.size == 0) or (w < 20) or (h < 20)
-    resized = cv2.resize(crop, (model_input_size[1], model_input_size[0]),
-                        interpolation=cv2.INTER_AREA)
-    # Normalize: (img / 255 - mean) / std
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    normalized = (resized / 255.0 - mean) / std
-    
-    # Convert to CHW
-    input_tensor = np.transpose(normalized, (2, 0, 1)).astype(np.float32)
-    return input_tensor, (x1, y1, x2, y2), (cx, cy), w, h, flag
 
 class VisionPipeline:
     def __init__(self,

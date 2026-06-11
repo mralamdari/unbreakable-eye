@@ -1,0 +1,12 @@
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.dev
+    env_file: .env
+    volumes:
+      - ./src:/app/src          # ← live code mounting, edits reflected immediately
+      - ./data:/app/data
+      - ./models:/app/models
+    ports:
+      - "8000:8000"             # ← direct access, no nginx in dev

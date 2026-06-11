@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # --- INPUT ---
     RTSP_URL: str = "0" # "0" for webcam, or actual RTSP link
 
-    SECRET_KEY: str = "$%RFaw9efoq4a%'adf3_aW343"
+    SECRET_KEY: str = "change-me-to-a-random-64-char-string"
 
     WORKING_HEIGHT: int = 512
     WORKING_WIDTH:  int = 512
@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     # --- COMPUTED PROPERTIES ---
     # BASE_DIR is fundamental for resolving local paths
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    DB_PATH: str = "instance/app.db"
+    DB_PATH: str = "data/db/surveillance.db"
     # Pydantic Settings configuration (essential for .env loading)
     model_config = SettingsConfigDict(
         env_file=".env", 

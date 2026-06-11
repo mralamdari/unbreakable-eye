@@ -29,11 +29,6 @@ models/
 data/
 logs/
 
-# Database
-*.db
-*.sqlite3
-instance/
-
 
 # IDEs
 .vscode/
@@ -55,11 +50,14 @@ logs/
 Thumbs.db
 
 
-# --- IGNORE DATA ---
+# --- IGNORE DATA --- 
 data/
 *.mp4
 *.avi
 *.jpg
 *.png
 *.zip
-0_DELETE_MYOWNUNDERSTANDING.txt
+
+# Database
+data/db/*.db
+data/db/*.sqlite3

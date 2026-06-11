@@ -1,18 +1,21 @@
-version: '3.8'
-
 services:
-  eye-node:
+  fastapi:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile
-    image: unbreakable-eye:latest
-    container_name: eye_v1
-    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
     ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      # Override config here for deployment
-      - RTSP_URL=${RTSP_URL}
-      - CONFIDENCE=0.6
+      - "80:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./src/web/static:/app/src/web/static:ro
+    depends_on:
+      - fastapi
+    restart: unless-stopped

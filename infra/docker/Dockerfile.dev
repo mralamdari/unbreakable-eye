@@ -1,0 +1,11 @@
+# infra/docker/Dockerfile.dev  ← development image
+FROM python:3.10-slim
+
+WORKDIR /app
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+
+# No COPY of src/ — we mount it as a volume so edits reflect immediately
+# No non-root user — easier for debugging
+
+CMD ["uvicorn", "src.web.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--workers", "1"]

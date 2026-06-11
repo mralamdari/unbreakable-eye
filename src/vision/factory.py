@@ -1,13 +1,11 @@
 from loguru import logger
 from src.core.config import settings, ModelType
-from src.vision.models.yolox import YoloXDetector
-from src.vision.models.hf import HFTransformerDetector
-from src.vision.models.openvino import OpenVinoDetector
-from src.vision.models.ultralytics_yolo import UltralyticsDetector
-from src.vision.models.ultralytics_yolo_onnx import UltralyticsONNXDetector
-
+from src.vision.detectors.yolox import YoloXDetector
+from src.vision.detectors.hf import HFTransformerDetector
+from src.vision.detectors.openvino import OpenVinoDetector
+from src.vision.detectors.ultralytics_yolo import UltralyticsDetector
+from src.vision.detectors.ultralytics_yolo_onnx import UltralyticsONNXDetector
 from src.vision.utils import resolve_model_path
-from src.core.exceptions import ModelResolutionError # Import our custom exception
 
 
 def get_detector():
@@ -24,7 +22,7 @@ def get_detector():
     try:
         model_local_path = resolve_model_path()
         logger.info(f"Resolved model path: {model_local_path}")
-    except ModelResolutionError as e:
+    except Exception as e:
         logger.critical(f"🔥 FATAL MODEL CONFIG ERROR: {e}")
         raise # Re-raise the error to stop application startup
     
@@ -67,4 +65,5 @@ def get_detector():
         )
     
     else:
-        raise ModelResolutionError(f"Internal Error: Unknown or unsupported Model Architecture: '{arch.value}'. ")
+        print(f"Internal Error: Unknown or unsupported Model Architecture: '{arch.value}'. ")
+        raise f"Internal Error: Unknown or unsupported Model Architecture: '{arch.value}'. "

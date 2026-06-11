@@ -1,14 +1,36 @@
 import os
 import re
+import numpy as np
+import cv2
 import shutil
+import onnxruntime as ort
 import requests
 from loguru import logger
 # from huggingface_hub import hf_hub_download, HfHubDisabledCache, HfHubError
 from huggingface_hub import hf_hub_download
 from src.core.config import settings, ModelType # Import ModelType for explicit routing
-from src.core.exceptions import ModelResolutionError # Our custom exception
 
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
+
+
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
+os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
+os.environ["KMP_BLOCKTIME"] = "0"
+
+def create_session(model_path, num_threads=2):
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.enable_mem_pattern = True
+    sess_options.enable_cpu_mem_arena = True
+    sess_options.intra_op_num_threads = num_threads
+    sess_options.inter_op_num_threads = 2
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    available = ort.get_available_providers()
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
+    return ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+    
 
 # --- Constants ---
 YOLOX_GITHUB_BASE_URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/"
@@ -43,8 +65,7 @@ def _infer_default_filename(model_arch: ModelType) -> str:
     # Fallback
     else:
         logger.warning(f"No specific default file for {model_arch}")
-        raise ModelResolutionError(f"Cannot infer default filename for architecture '{model_arch}'. "
-                           "Please ensure MODEL_ARCH in the .env is from this list: [yolox, dfine, rfdetr, ultralytics, openvino]")
+        raise f"Cannot infer default filename for architecture '{model_arch}'. Please ensure MODEL_ARCH in the .env is from this list: [yolox, dfine, rfdetr, ultralytics, openvino]"
 
 def _process_ultralytics_model(repo_id_or_model_name: str, target_file_path: str):
     """
@@ -82,7 +103,7 @@ def _process_ultralytics_model(repo_id_or_model_name: str, target_file_path: str
         
     except Exception as e:
         logger.error(f"❌ Model not found locally and Failed to download model '{repo_id_or_model_name}' from Ultralytics: {e}")
-        raise ModelResolutionError(f"Failed to process Ultralytics model '{repo_id_or_model_name}': {e}") from e
+        raise f"Failed to process Ultralytics model '{repo_id_or_model_name}': {e}"
 
 def download_yolox_from_github(url: str, destination_path: str, timeout: int = 30) -> None:
     """Safely downloads a file from a given URL to a destination."""
@@ -101,7 +122,7 @@ def download_yolox_from_github(url: str, destination_path: str, timeout: int = 3
         return destination_path
     except requests.RequestException as exc:
         logger.error(f"❌ Failed to download the {url.rsplit('/',1)} model from GitHub: {exc}")
-        raise ModelResolutionError(f"Failed to download from GitHub URL {url}: {exc}") from exc
+        raise f"Failed to download from GitHub URL {url}: {exc}"
 
 def download_from_hf(repo_id: str, final_local_dir: str, model_file_path: str) -> str:
     # from huggingface_hub import hf_hub_download
@@ -123,12 +144,10 @@ def download_from_hf(repo_id: str, final_local_dir: str, model_file_path: str) -
             logger.success(f"✅ Moved {downloaded_path} -> {model_file_path}")
         except Exception as exc:
             logger.error(f"❌ Failed moving {downloaded_path} to {model_file_path}: {exc}")
-            raise ModelResolutionError(f"An unexpected error occurred during moving {final_local_dir}/onnx/model_quantized.onnx to {model_file_path}: {e}") from e
+            raise f"An unexpected error occurred during moving {final_local_dir}/onnx/model_quantized.onnx to {model_file_path}: {e}"
         return downloaded_path
-    # except HfHubError as e:
-    #     raise ModelResolutionError(f"Failed to download '{filename}' from HF Hub repo '{repo_id}': {e}") from e
     except Exception as e:
-        raise ModelResolutionError(f"Failed to download '{filename}' from HF Hub repo '{repo_id}': {e}") from e
+        raise f"Failed to download '{filename}' from HF Hub repo '{repo_id}': {e}"
 
 def model_id_provider(model_id: str, model_arch: ModelType):
         """
@@ -256,3 +275,23 @@ def resolve_model_path() -> str:
     else:
         logger.error(f"❌ An UnExpected Error happend while choosing the correct model path for {model_arch} based on the ModelArch")
     return model_file_path    
+
+
+def preprocess_crop(frame, bbox, model_input_size, torso_ratio=1.0):
+    x1, y1, x2, y2 = map(int, bbox)
+    w, h = x2 - x1, y2 - y1
+    cx, cy = (x1+x2)/2, (y1+y2)/2 
+    crop_y2 = int(y1 + h * torso_ratio)
+    crop = frame[y1:crop_y2, x1:x2]
+    flag =  (crop.size == 0) or (w < 20) or (h < 20)
+    resized = cv2.resize(crop, (model_input_size[1], model_input_size[0]),
+                        interpolation=cv2.INTER_AREA)
+    # Normalize: (img / 255 - mean) / std
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = (resized / 255.0 - mean) / std
+    
+    # Convert to CHW
+    input_tensor = np.transpose(normalized, (2, 0, 1)).astype(np.float32)
+    return input_tensor, (x1, y1, x2, y2), (cx, cy), w, h, flag
+

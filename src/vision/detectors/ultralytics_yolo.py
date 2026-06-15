@@ -1,24 +1,112 @@
+"""
+Ultralytics YOLOv8 detector wrapper using native PyTorch implementation.
+Best for: Real-time inference when GPU/CUDA is available.
+"""
+
 import numpy as np
-from ultralytics import YOLO
 import supervision as sv
+from loguru import logger
+
 from src.vision.base import BaseDetector
+from src.core.exceptions import ModelLoadError, InferenceError
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    raise ImportError("ultralytics not installed. Install with: pip install ultralytics")
+
 
 class UltralyticsDetector(BaseDetector):
-    def __init__(self, model_path: str, conf_thresh: float, device: str):
+    """
+    YOLO detector using Ultralytics native implementation.
+    Supports YOLOv8, YOLOv10, and other ultralytics models.
+    """
+
+    def __init__(self, model_path: str, conf_thresh: float = 0.45, device: str = "cuda"):
+        """
+        Args:
+            model_path: Path to .pt model file (e.g., yolov8n.pt)
+            conf_thresh: Confidence threshold
+            device: Device to use ("cuda" or "cpu")
+
+        Raises:
+            ModelLoadError: If model cannot be loaded
+        """
         self.confidence_threshold = conf_thresh
+        self.device = device.lower()
 
-        self.device = 0 if device.upper() in ["CUDA", "GPU"] else 'cpu'
-        # Warmup (Optional, but good for production)
-        # self.model.predict(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+        try:
+            logger.info(f"Loading YOLOv8 model from {model_path} on {self.device}")
+            self.model = YOLO(model_path)
+            logger.info(f"YOLOv8 model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load YOLOv8 model: {e}")
+            raise ModelLoadError(
+                f"Failed to load YOLOv8 model from {model_path}",
+                context={"path": model_path, "error": str(e)}
+            ) from e
 
-        self.model = YOLO(model_path)
-    
     def predict(self, frame: np.ndarray) -> sv.Detections:
-        results = self.model(
-            frame, 
-            conf=self.confidence_threshold, 
-            verbose=False,
-            device=self.device
-        )[0]
+        """
+        Run inference on a single frame.
 
-        return sv.Detections.from_ultralytics(results)
+        Args:
+            frame: Input BGR image
+
+        Returns:
+            sv.Detections object with boxes, confidence, class_id
+
+        Raises:
+            InferenceError: If inference fails
+        """
+        try:
+            results = self.model(
+                frame,
+                conf=self.confidence_threshold,
+                verbose=False,
+                device=self.device
+            )[0]
+            
+            detections = sv.Detections.from_ultralytics(results)
+            logger.debug(f"YOLOv8 inference: {len(detections)} detections")
+            return detections
+
+        except Exception as e:
+            logger.error(f"YOLOv8 inference failed: {e}")
+            raise InferenceError(
+                f"YOLOv8 inference failed",
+                context={"frame_shape": frame.shape, "error": str(e)}
+            ) from e
+
+    def predict_batch(self, frames: list[np.ndarray]) -> list[sv.Detections]:
+        """
+        Run inference on multiple frames.
+
+        Args:
+            frames: List of BGR images
+
+        Returns:
+            List of sv.Detections objects
+
+        Raises:
+            InferenceError: If any inference fails
+        """
+        try:
+            results = self.model(
+                frames,
+                conf=self.confidence_threshold,
+                verbose=False,
+                device=self.device
+            )
+            
+            detections_list = [sv.Detections.from_ultralytics(r) for r in results]
+            logger.debug(f"YOLOv8 batch inference: {len(frames)} frames, "
+                        f"{sum(len(d) for d in detections_list)} total detections")
+            return detections_list
+
+        except Exception as e:
+            logger.error(f"YOLOv8 batch inference failed: {e}")
+            raise InferenceError(
+                f"YOLOv8 batch inference failed",
+                context={"num_frames": len(frames), "error": str(e)}
+            ) from e

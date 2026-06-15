@@ -1,297 +1,451 @@
+"""
+Shared preprocessing and inference utilities for all vision models.
+These functions are model-agnostic and used by multiple detector backends.
+"""
+
 import os
-import re
-import numpy as np
 import cv2
-import shutil
+import numpy as np
 import onnxruntime as ort
-import requests
 from loguru import logger
-# from huggingface_hub import hf_hub_download, HfHubDisabledCache, HfHubError
-from huggingface_hub import hf_hub_download
-from src.core.config import settings, ModelType # Import ModelType for explicit routing
+from typing import Tuple
+from src.core.exceptions import PreprocessError
 
-os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
-
-
+# ONNX Runtime optimization settings
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
 os.environ["KMP_AFFINITY"] = "granularity=fine,compact,1,0"
 os.environ["KMP_BLOCKTIME"] = "0"
 
-def create_session(model_path, num_threads=2):
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.enable_mem_pattern = True
-    sess_options.enable_cpu_mem_arena = True
-    sess_options.intra_op_num_threads = num_threads
-    sess_options.inter_op_num_threads = 2
-    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
-    available = ort.get_available_providers()
-    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
-    return ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
-    
 
-# --- Constants ---
-YOLOX_GITHUB_BASE_URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/"
-# Regex to check if a string looks like a Hugging Face repo_id (e.g., "org/repo-name")
-HF_REPO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9-]+\/[a-zA-Z0-9-.]+$")
+# ─────────────────────────────────────────────────────────────────────────────
+# ONNX Runtime Session Management
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def _infer_default_filename(model_arch: ModelType) -> str:
+def create_session(model_path: str, num_threads: int = 2) -> ort.InferenceSession:
     """
-    Returns ONLY the default filename (not the full path) 
-    based on the ModelType enum.
-    """
-    # Ultralytics / YoloV8
-    if model_arch == ModelType.ULTRALYTICS:
-        return "yolov8n.pt"
-    
-    # YoloX
-    elif model_arch == ModelType.YOLOX:
-        return "yolox_nano.onnx"
-    
-    # Onnx Community (DFINE / RFDETR)
-    elif model_arch == ModelType.RFDETR:
-        return "rfdetr_r18vd.onnx"
+    Create an optimized ONNX Runtime session with tuned performance settings.
 
-    elif model_arch == ModelType.DFINE:
-        return "dfine_n_coco.onnx"
-    
-    # OpenVINO
-    elif model_arch == ModelType.OPENVINO:
-        return "person-detection-retail-0013.xml"
-        
-    # Fallback
-    else:
-        logger.warning(f"No specific default file for {model_arch}")
-        raise f"Cannot infer default filename for architecture '{model_arch}'. Please ensure MODEL_ARCH in the .env is from this list: [yolox, dfine, rfdetr, ultralytics, openvino]"
+    Args:
+        model_path: Path to .onnx model file
+        num_threads: Number of threads for intra-op parallelism (usually CPU_COUNT // 2 - 1)
 
-def _process_ultralytics_model(repo_id_or_model_name: str, target_file_path: str):
+    Returns:
+        Configured ort.InferenceSession
+
+    Raises:
+        FileNotFoundError: If model_path doesn't exist
+        ort.InvalidProtobuf: If model is corrupted
     """
-    Downloads an Ultralytics .pt model (or uses existing) and exports it to ONNX.
-    """
-    from ultralytics import YOLO
-    logger.info(f"🔄 Processing Ultralytics model: {repo_id_or_model_name}")
+    if not os.path.exists(model_path):
+        logger.error(f"Model file not found: {model_path}")
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
     try:
-        pt_model_path = target_file_path.replace('.onnx', '.pt') #if .onnx provided, The YOLO needs the .pt file first
-        logger.info(f"🌐 Downloading Ultralytics model: {repo_id_or_model_name}")
-        model = YOLO(pt_model_path, task='detect') 
-        if target_file_path.lower().endswith(".onnx"):
-            export_args = {
-            "format": "onnx",
-            "imgsz": 640, # Common input size, ensure your model is trained for this or adaptable
-            "simplify": True,
-            "opset": 13
-            }
-            # Ultralytics export creates a file in the same directory as the .pt model by default.
-            # We need to ensure it lands in target_file_path.
-            exported_onnx_file = model.export(**export_args)
-            # exported_onnx_file = model.export(format="onnx", simplify=True, opset=13, imgsz=640)
-            # Check if the exported file needs to be moved/renamed
-            if not os.path.samefile(exported_onnx_file, pt_model_path):
-                os.makedirs(os.path.dirname(pt_model_path), exist_ok=True)
-                shutil.move(exported_onnx_file, pt_model_path)
-                
-            if not exported_onnx_file:
-                raise Exception("Ultralytics export returned no results path.")
-            
-            logger.success(f"✅ Ultralytics model exported to ONNX: {pt_model_path}")
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.enable_mem_pattern = True
+        sess_options.enable_cpu_mem_arena = True
+        sess_options.intra_op_num_threads = num_threads
+        sess_options.inter_op_num_threads = 2
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
+        available = ort.get_available_providers()
+        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
         
-        del model
-        return pt_model_path
-        
+        if not providers:
+            logger.warning("No execution providers available, falling back to CPU")
+            providers = ["CPUExecutionProvider"]
+
+        logger.debug(f"Creating ONNX session with providers: {providers}")
+        session = ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+        logger.info(f"ONNX model loaded successfully: {model_path}")
+        return session
+
     except Exception as e:
-        logger.error(f"❌ Model not found locally and Failed to download model '{repo_id_or_model_name}' from Ultralytics: {e}")
-        raise f"Failed to process Ultralytics model '{repo_id_or_model_name}': {e}"
+        logger.error(f"Failed to create ONNX session: {e}")
+        raise
 
-def download_yolox_from_github(url: str, destination_path: str, timeout: int = 30) -> None:
-    """Safely downloads a file from a given URL to a destination."""
-    logger.info(f"🌐 Downloading yolox model from URL: {url}")
-    try:
-        os.makedirs(os.path.dirname(destination_path), exist_ok=True) # Ensure destination dir exists
-        tmp_dest = destination_path + ".part" # Download to temp file first
-        with requests.get(url, stream=True, timeout=timeout) as response:
-            response.raise_for_status() # Raise an exception for bad status codes
-            with open(tmp_dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        shutil.move(tmp_dest, destination_path) # Atomically move to final destination
-        logger.success(f"✅ {url.rsplit('/',1)} Downloaded to: {destination_path} Successfully")
-        return destination_path
-    except requests.RequestException as exc:
-        logger.error(f"❌ Failed to download the {url.rsplit('/',1)} model from GitHub: {exc}")
-        raise f"Failed to download from GitHub URL {url}: {exc}"
 
-def download_from_hf(repo_id: str, final_local_dir: str, model_file_path: str) -> str:
-    # from huggingface_hub import hf_hub_download
-    """Downloads a file from Hugging Face Hub."""
-    filename = settings.HF_MODEL_FILENAME if settings.HF_MODEL_FILENAME else "onnx/model_quantized.onnx"
-    logger.info(f"🌐 Downloading '{filename}' from Hugging Face Hub ({repo_id})...")
-    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1' 
-    try:
-        downloaded_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            cache_dir=os.path.join(settings.BASE_DIR, "hf_cache"), # Dedicated cache dir
-            local_dir=final_local_dir, 
-            local_dir_use_symlinks=False
-        )
-        logger.success(f"✅ Downloaded from HF Hub to: {downloaded_path}")
-        try:
-            shutil.move(downloaded_path, model_file_path)
-            logger.success(f"✅ Moved {downloaded_path} -> {model_file_path}")
-        except Exception as exc:
-            logger.error(f"❌ Failed moving {downloaded_path} to {model_file_path}: {exc}")
-            raise f"An unexpected error occurred during moving {final_local_dir}/onnx/model_quantized.onnx to {model_file_path}: {e}"
-        return downloaded_path
-    except Exception as e:
-        raise f"Failed to download '{filename}' from HF Hub repo '{repo_id}': {e}"
+# ─────────────────────────────────────────────────────────────────────────────
+# Image Preprocessing — Letterbox / Padding
+# ─────────────────────────────────────────────────────────────────────────────
 
-def model_id_provider(model_id: str, model_arch: ModelType):
-        """
-        Resolves the model defined in settings to an absolute local file path,
-        downloading from appropriate sources (local, Hugging Face, GitHub) if necessary.
-        
-        Returns:
-            The absolute local path to the model file.
-            
-        Raises:
-            FileNotFoundError: If the model cannot be found or downloaded.
-            
-        It can even handle the cases where we only have Model_ID with no Model_Arch 
-        """
-        # Clean input (handle None or whitespace)
-        mid = model_id.strip() if model_id else ""
-        
-        # Get a set of valid directory names (values of the Enum)
-        valid_arch_dirs = {m.value for m in ModelType}
-        # ---------------------------------------------------------
-        # SCENARIOS 1 & 2: No model_id provided
-        # ---------------------------------------------------------
-        if not mid:
-            if not model_arch:
-                # Scenario 1: No ID, No Arch ==> Error
-                raise ValueError("Error: Both model_id and model_arch are missing. Please specify at least one.")
-            else:
-                # Scenario 2: No ID, Arch exists ==> Use Default
-                filename = _infer_default_filename(model_arch)
-                return f"{model_arch.value}/{filename}", model_arch
+def letterbox(
+    img: np.ndarray,
+    target_h: int,
+    target_w: int,
+    pad_value: int = 114
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """
+    Resize image with aspect ratio preservation + padding (letterbox).
+    Used by: YOLO, YOLOX, some Transformers.
 
-        # Analyze structure of input ID
-        parts = mid.rsplit('/', 1)
-        
-        # ---------------------------------------------------------
-        # HANDLING NO SLASH (Could be a Filename OR an Arch/Dir name)
-        # ---------------------------------------------------------
-        if len(parts) == 1:
-            # Check if the single string is actually a known architecture directory (e.g., 'ultralytics')
-            is_directory_name = mid in valid_arch_dirs
+    Args:
+        img: Input BGR image (HxWx3)
+        target_h: Target height
+        target_w: Target width
+        pad_value: Padding color (default 114 = gray for YOLO, 0 = black for some transformers)
 
-            if is_directory_name:
-                # SCENARIO 5 & 6: Input is just the Arch name (e.g. 'ultralytics')
-                # If model_arch is provided (Scenario 6), it technically overrides, 
-                # but usually, they match. If not (Scenario 5), we infer arch from the string.
-                
-                # If explicit arch is given, use it; otherwise, look up Enum by value
-                final_arch = model_arch if model_arch else ModelType(mid)
-                filename = _infer_default_filename(final_arch)
-                return f"{final_arch.value}/{filename}", final_arch
-                
-            else:
-                # SCENARIO 3 & 4: Input is a Filename (e.g. 'yolov8n.pt')
-                if not model_arch:
-                    # Scenario 3: Filename given, but we don't know the folder ==> Error
-                    raise ValueError(f"Error: model_id '{mid}' looks like a filename, but no model_arch was specified to provide the folder path.")
-                else:
-                    # Scenario 4: Filename + Arch ==> Combine
-                    return f"{model_arch.value}/{mid}", model_arch
+    Returns:
+        (padded_image, (top_pad, left_pad)) where padded_image is target_h x target_w
+    """
+    shape = img.shape[:2]  # (H, W)
+    r = min(target_h / shape[0], target_w / shape[1])
+    new_unpad = (round(shape[1] * r), round(shape[0] * r))  # (W, H)
+    dw, dh = (target_w - new_unpad[0]) / 2, (target_h - new_unpad[1]) / 2
 
-        # ---------------------------------------------------------
-        # HANDLING WITH SLASH (Full Path Input)
-        # ---------------------------------------------------------
-        else: 
-            # model_id looks like "folder/file.pt" or "wrong/file.pt"
-            # We assume the first part is the folder, the rest is the file
-            current_dir = parts[0]
-            current_file = "/".join(parts[1:]) # Joins rest in case file has sub-slashes
-            
-            if model_arch:
-                # SCENARIO 8: Full path + Arch ==> Override/Correction
-                # The user provided a path, but ALSO an explicit architecture.
-                # We trust the architecture (ModelType) and force that directory,
-                # ignoring the directory inside model_id.
-                return f"{model_arch.value}/{current_file}", model_arch
-                
-            else:
-                # SCENARIO 7: Full path + No Arch ==> Validate
-                # We must check if the folder provided in model_id is valid.
-                if current_dir in valid_arch_dirs:
-                    return mid, ModelType(current_dir)
-                else:
-                    # Fallback / Error if the folder in string is unknown and no Arch provided
-                    logger.warning(f"The provided directory '{current_dir}' is not a known ModelType. defaulting to OpenVINO")
-                    return  'openvino/'+_infer_default_filename(ModelType('openvino')), ModelType('openvino')
-                
-        
-def resolve_model_path() -> str:
-    model_id = settings.MODEL_ID
-    model_arch = settings.MODEL_ARCH 
-    filename_to_use, model_arch =  model_id_provider(model_id, model_arch)   
+    # Resize
+    if shape[::-1] != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
 
-    # 2. Determine the target local directory for this model
-    # Hierarchical storage: models/{MODEL_ARCH_NAME}/{MODEL_ID_NORMALIZED}/filename
-    # E.g., models/yolov8/ultralytics_yolov8n-pt/yolov8n.pt
-    repo_id = filename_to_use.rsplit('/', 1)[0]
-    repo_name = settings.HF_MODEL_REPONAME
-    if repo_name and model_arch in [ModelType.DFINE, ModelType.RFDETR]:  # Huggingace files are from a repositoy with the name: HF_MODEL_REPONAME
-        filename_to_use = filename_to_use.replace(repo_id, repo_name)
-        repo_id = repo_name
-    final_local_dir = os.path.join(settings.BASE_DIR, "models", repo_id)
-    model_file_path = os.path.join(settings.BASE_DIR, "models", filename_to_use)
-    os.makedirs(final_local_dir, exist_ok=True)
+    # Pad
+    top, bottom = round(dh - 0.1), round(dh + 0.1)
+    left, right = round(dw - 0.1), round(dw + 0.1)
+    img = cv2.copyMakeBorder(img, top, bottom, left, right,
+                             cv2.BORDER_CONSTANT, value=(pad_value, pad_value, pad_value))
+    return img, (top, left)
+
+
+def aspect_ratio_resize(
+    img: np.ndarray,
+    target_h: int,
+    target_w: int
+) -> Tuple[np.ndarray, float]:
+    """
+    Resize with aspect ratio preservation (no padding, just scaling).
+    Used by: Some OpenVINO models, custom pipelines.
+
+    Args:
+        img: Input BGR image
+        target_h: Target height
+        target_w: Target width
+
+    Returns:
+        (resized_image, scale_ratio) where scale_ratio is the scaling factor
+    """
+    h, w = img.shape[:2]
+    scale = min(target_h / h, target_w / w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return resized, scale
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalization Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_imagenet(img: np.ndarray) -> np.ndarray:
+    """
+    ImageNet normalization: scale to [0, 1], then apply mean/std.
+    Used by: Vision Transformers, DETR models, some YOLO variants.
     
-    # 3. If the resolved file already exists locally, use it
-    if os.path.exists(model_file_path):
-        logger.info(f"💾 Using local model: {model_file_path}")
-        return model_file_path
-    
-    # 4. If not local, attempt download/processing based on MODEL_ARCH and MODEL_ID format
-    logger.info(f"⏳ Model '{model_id}' (arch: {model_arch}) not found locally. Attempting to resolve...")
-        
-    # Download ultralytics (can download the onnx file too)
-    if model_arch == ModelType.ULTRALYTICS:
-        model_file_path = _process_ultralytics_model(model_id, model_file_path)
-    
-    # Download the yolox model from the Github
-    elif model_arch == ModelType.YOLOX:
-        yolox_url = os.path.join(YOLOX_GITHUB_BASE_URL, filename_to_use)  #???????????????????????? YOLOX_GITHUB_BASE_URL/yolox/yolox_nano.onnx    or YOLOX_GITHUB_BASE_URL/yolox_nano.onnx
-        model_file_path = download_yolox_from_github(yolox_url, model_file_path)
-    
-    # 4. If not local, and it looks like a Hugging Face repo_id, download it
-    elif model_arch in [ModelType.DFINE, ModelType.RFDETR]:
-        model_file_path = download_from_hf(model_id, final_local_dir, model_file_path)
-    else:
-        logger.error(f"❌ An UnExpected Error happend while choosing the correct model path for {model_arch} based on the ModelArch")
-    return model_file_path    
+    Formula: (img / 255.0 - mean) / std
+    where mean = [0.485, 0.456, 0.406] and std = [0.229, 0.224, 0.225]
 
+    Args:
+        img: Input image in [0, 255] range, float32 or uint8
 
-def preprocess_crop(frame, bbox, model_input_size, torso_ratio=1.0):
-    x1, y1, x2, y2 = map(int, bbox)
-    w, h = x2 - x1, y2 - y1
-    cx, cy = (x1+x2)/2, (y1+y2)/2 
-    crop_y2 = int(y1 + h * torso_ratio)
-    crop = frame[y1:crop_y2, x1:x2]
-    flag =  (crop.size == 0) or (w < 20) or (h < 20)
-    resized = cv2.resize(crop, (model_input_size[1], model_input_size[0]),
-                        interpolation=cv2.INTER_AREA)
-    # Normalize: (img / 255 - mean) / std
+    Returns:
+        Normalized image as float32
+    """
+    if img.dtype == np.uint8:
+        img = img.astype(np.float32) / 255.0
+    
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    normalized = (resized / 255.0 - mean) / std
-    
-    # Convert to CHW
-    input_tensor = np.transpose(normalized, (2, 0, 1)).astype(np.float32)
-    return input_tensor, (x1, y1, x2, y2), (cx, cy), w, h, flag
+    return (img - mean) / std
 
+
+def normalize_simple(img: np.ndarray) -> np.ndarray:
+    """
+    Simple 0-1 normalization: just scale to [0, 1].
+    Used by: YOLO, YOLOX, most CNN detectors.
+
+    Args:
+        img: Input image uint8 or float in [0, 255]
+
+    Returns:
+        Normalized image as float32 in [0, 1]
+    """
+    if img.dtype == np.uint8:
+        return img.astype(np.float32) / 255.0
+    return img.astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image Format Conversions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def to_chw_float32(img: np.ndarray, normalize: bool = True) -> np.ndarray:
+    """
+    Convert HWC uint8 image to CHW float32 format for inference.
+
+    Args:
+        img: Input HxWx3 image (uint8 or float)
+        normalize: If True, scale to [0, 1]
+
+    Returns:
+        CxHxW float32 tensor ready for ONNX/TensorRT
+    """
+    if img.dtype == np.uint8 and normalize:
+        img = img.astype(np.float32) / 255.0
+    else:
+        img = img.astype(np.float32)
+    
+    chw = np.transpose(img, (2, 0, 1))
+    return np.ascontiguousarray(chw)
+
+
+def bgr_to_rgb(img: np.ndarray) -> np.ndarray:
+    """Convert BGR image to RGB (important for transformers)."""
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bounding Box Operations
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cxcywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
+    """
+    Convert bounding boxes from center format (cx, cy, w, h) to corner format (x1, y1, x2, y2).
+    
+    Args:
+        boxes: Nx4 array in [cx, cy, w, h] format
+
+    Returns:
+        Nx4 array in [x1, y1, x2, y2] format
+    """
+    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+
+def xyxy_to_cxcywh(boxes: np.ndarray) -> np.ndarray:
+    """
+    Convert bounding boxes from corner format (x1, y1, x2, y2) to center format (cx, cy, w, h).
+    
+    Args:
+        boxes: Nx4 array in [x1, y1, x2, y2] format
+
+    Returns:
+        Nx4 array in [cx, cy, w, h] format
+    """
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    w = x2 - x1
+    h = y2 - y1
+    return np.stack([cx, cy, w, h], axis=1)
+
+
+def scale_boxes(
+    boxes: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+    clip_h: int = None,
+    clip_w: int = None
+) -> np.ndarray:
+    """
+    Scale bounding boxes by given factors and optionally clip to image boundaries.
+
+    Args:
+        boxes: Nx4 array in [x1, y1, x2, y2] format
+        scale_x: Horizontal scale factor
+        scale_y: Vertical scale factor
+        clip_h: Image height for clipping (optional)
+        clip_w: Image width for clipping (optional)
+
+    Returns:
+        Scaled and optionally clipped boxes
+    """
+    scaled = boxes.copy()
+    scaled[:, 0::2] *= scale_x  # x1, x2
+    scaled[:, 1::2] *= scale_y  # y1, y2
+
+    if clip_h is not None and clip_w is not None:
+        scaled[:, 0] = np.clip(scaled[:, 0], 0, clip_w)  # x1
+        scaled[:, 1] = np.clip(scaled[:, 1], 0, clip_h)  # y1
+        scaled[:, 2] = np.clip(scaled[:, 2], 0, clip_w)  # x2
+        scaled[:, 3] = np.clip(scaled[:, 3], 0, clip_h)  # y2
+
+    return scaled
+
+
+def remove_letterbox_padding(
+    boxes: np.ndarray,
+    top_pad: int,
+    left_pad: int,
+    scale: float
+) -> np.ndarray:
+    """
+    Convert box coordinates from letterbox space back to original image space.
+
+    Args:
+        boxes: Nx4 array in [x1, y1, x2, y2] format (in letterbox space)
+        top_pad: Padding added to top
+        left_pad: Padding added to left
+        scale: Scale factor used during letterbox
+
+    Returns:
+        Boxes in original image space
+    """
+    unpadded = boxes.copy()
+    unpadded[:, 0] = (unpadded[:, 0] - left_pad) / scale  # x1
+    unpadded[:, 1] = (unpadded[:, 1] - top_pad) / scale   # y1
+    unpadded[:, 2] = (unpadded[:, 2] - left_pad) / scale  # x2
+    unpadded[:, 3] = (unpadded[:, 3] - top_pad) / scale   # y3
+    return unpadded
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NMS Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_nms_supervision(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float
+) -> np.ndarray:
+    """
+    Apply NMS using supervision library.
+
+    Args:
+        boxes: Nx4 array in [x1, y1, x2, y2]
+        scores: N array of confidence scores
+        iou_threshold: NMS threshold
+
+    Returns:
+        Array of indices to keep
+    """
+    import supervision as sv
+    nms_boxes = np.stack([boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3], scores], axis=1)
+    indices = sv.box_non_max_suppression(nms_boxes, iou_threshold)
+    return indices
+
+
+def apply_nms_opencv(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    score_threshold: float,
+    iou_threshold: float
+) -> np.ndarray:
+    """
+    Apply NMS using OpenCV (cv2.dnn.NMSBoxes).
+
+    Args:
+        boxes: Nx4 array in [x1, y1, x2, y2]
+        scores: N array of confidence scores
+        score_threshold: Confidence threshold
+        iou_threshold: NMS threshold
+
+    Returns:
+        Array of indices to keep
+    """
+    # cv2.dnn.NMSBoxes expects [x, y, w, h] format
+    xywh_boxes = []
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        xywh_boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+
+    indices = cv2.dnn.NMSBoxes(xywh_boxes, scores.tolist(), score_threshold, iou_threshold)
+    return np.array(indices, dtype=int).flatten() if len(indices) > 0 else np.array([], dtype=int)
+
+
+"""
+Re-ID crop preprocessing.
+
+Converts a detection bounding box into a normalized crop tensor ready
+for the Re-ID embedding model (OSNet). This is a distinct concern from
+detector preprocessing (src/vision/utils.py) — it operates on crops of
+already-detected people, not full frames, and always uses ImageNet
+normalization regardless of which detector produced the box.
+
+Used by: src/engine/pipeline.py (embedder_worker)
+"""
+
+# OSNet / ImageNet normalization constants
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# Minimum bbox dimensions (pixels) below which a crop is considered too
+# small/unreliable for Re-ID — these people get flagged via `flag=True`
+# and skipped from embedding, but still tracked.
+_MIN_BBOX_DIM = 20
+
+
+def preprocess_crop(
+    frame: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    model_input_size: tuple[int, int],
+    torso_ratio: float = 1.0,
+) -> Tuple[np.ndarray, Tuple[int, int, int, int], Tuple[float, float], int, int, bool]:
+    """
+    Crop a detection bounding box from a frame and preprocess it for Re-ID.
+
+    Args:
+        frame: Full BGR frame (HxWx3)
+        bbox: (x1, y1, x2, y2) detection box in frame coordinates
+        model_input_size: (H, W) expected by the Re-ID model, e.g. (256, 128)
+        torso_ratio: Fraction of the bbox height to keep, measured from the
+            top. 1.0 = full body. 0.5 = upper half only (useful when legs
+            are frequently occluded by shelves/counters).
+
+    Returns:
+        Tuple of:
+            input_tensor: (3, H, W) float32, ImageNet-normalized, ready for OSNet
+            crop_box: (x1, y1, x2, y2) as ints — the actual region cropped
+            center_point: (cx, cy) center of the original bbox
+            bbox_w: width of the original bbox
+            bbox_h: height of the original bbox
+            flag: True if this crop should be SKIPPED for embedding
+                  (too small or empty) — caller checks `if not flag`
+
+    Raises:
+        PreprocessError: If the crop produces an invalid tensor shape
+    """
+    x1, y1, x2, y2 = map(int, bbox)
+    bbox_w, bbox_h = x2 - x1, y2 - y1
+    center_point = ((x1 + x2) / 2, (y1 + y2) / 2)
+
+    # Apply torso ratio — keep only the top portion of the box
+    crop_y2 = int(y1 + bbox_h * torso_ratio)
+    crop = frame[y1:crop_y2, x1:x2]
+
+    # Flag unusable crops: empty array or below minimum size.
+    # Caller must check this flag BEFORE using input_tensor — when flag is
+    # True, input_tensor is a zero-filled placeholder, not a real crop.
+    too_small = bbox_w < _MIN_BBOX_DIM or bbox_h < _MIN_BBOX_DIM
+    is_empty = crop.size == 0
+    flag = too_small or is_empty
+
+    if flag:
+        logger.debug(
+            f"Skipping crop: bbox=({x1},{y1},{x2},{y2}) "
+            f"size={bbox_w}x{bbox_h} empty={is_empty}"
+        )
+        # Return a correctly-shaped placeholder so callers that build a
+        # batch array don't need special-case shape handling.
+        placeholder = np.zeros((3, model_input_size[0], model_input_size[1]), dtype=np.float32)
+        return placeholder, (x1, y1, x2, y2), center_point, bbox_w, bbox_h, flag
+
+    try:
+        resized = cv2.resize(
+            crop, (model_input_size[1], model_input_size[0]),  # cv2 wants (W, H)
+            interpolation=cv2.INTER_AREA
+        )
+
+        normalized = (resized.astype(np.float32) / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
+        input_tensor = np.transpose(normalized, (2, 0, 1)).astype(np.float32)  # HWC -> CHW
+
+        return input_tensor, (x1, y1, x2, y2), center_point, bbox_w, bbox_h, flag
+
+    except Exception as e:
+        raise PreprocessError(
+            "Re-ID crop preprocessing failed",
+            context={"bbox": bbox, "crop_shape": crop.shape, "error": str(e)}
+        ) from e

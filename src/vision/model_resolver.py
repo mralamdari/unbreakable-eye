@@ -1,157 +1,145 @@
 """
 Model path resolution and downloading.
 
-Resolves a model file path from settings (MODEL_ID, MODEL_ARCH) by:
-1. Checking if the file already exists locally under models/
-2. If not, downloading it from the appropriate source:
-   - Ultralytics: download .pt and export to .onnx
-   - YOLOX: download .onnx from GitHub releases
-   - DFINE/RFDETR: download .onnx from HuggingFace Hub
-   - OpenVINO: must already exist locally (no auto-download source)
+Called ONCE at startup by factory.py — not on the per-frame hot path.
+Correctness and clear error messages matter more than speed here.
 
-This module is imported ONCE at startup by factory.py — it is not
-part of the per-frame inference hot path, so correctness and clear
-error messages matter more than raw speed here.
+Resolution order for every architecture:
+  1. Check if the model file already exists locally under models/
+  2. If not, download from the appropriate source:
+       ULTRALYTICS / YOLO_ONNX → ultralytics package (.pt export to .onnx)
+       YOLOX               → GitHub releases (.onnx direct download)
+       RFDETR / DFINE      → HuggingFace Hub (.onnx via hf_hub_download)
+       OPENVINO            → Intel Open Model Zoo (.xml + .bin via urllib)
 """
 
 import os
 import re
 import shutil
+import urllib.request
 from functools import lru_cache
+from typing import Optional
 
 import requests
 from loguru import logger
 from huggingface_hub import hf_hub_download
 
 from src.core.config import settings, ModelType
-from src.core.exceptions import ModelResolutionError, ModelDownloadError, ModelConfigError
+from src.core.exceptions import ModelConfigError, ModelDownloadError, ModelResolutionError
 
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+# ── Environment ───────────────────────────────────────────────────────────────
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
-# --- Constants ---
-YOLOX_GITHUB_BASE_URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/"
+# ── Constants ─────────────────────────────────────────────────────────────────
+_YOLOX_GITHUB_BASE = (
+    "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/"
+)
+_OPENVINO_OMZ_BASE = (
+    "https://storage.openvinotoolkit.org/repositories/open_model_zoo/"
+    "2023.0/models_bin/1/person-detection-retail-0013"
+)
 
-# Regex for "org/repo-name" style HuggingFace repo IDs
-HF_REPO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9-]+/[a-zA-Z0-9-.]+$")
+# Default filename for each architecture — used when MODEL_ID is empty
+_ARCH_DEFAULTS: dict[ModelType, str] = {
+    ModelType.ULTRALYTICS: "yolov8n.pt",
+    ModelType.YOLO_ONNX:   "yolov8n.onnx",
+    ModelType.YOLOX:       "yolox_nano.onnx",
+    ModelType.RFDETR:      "rfdetr_r18vd.onnx",
+    ModelType.DFINE:       "dfine_n_coco.onnx",
+    ModelType.OPENVINO:    "person-detection-retail-0013.xml",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Default filenames per architecture
+# Config parsing — MODEL_ID + MODEL_ARCH → relative local path
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _infer_default_filename(model_arch: ModelType) -> str:
+def _default_filename(model_arch: ModelType) -> str:
     """
-    Return the default filename for a given model architecture.
+    Return the canonical default filename for *model_arch*.
 
-    Used when MODEL_ID is empty and only MODEL_ARCH is set in settings —
-    lets a user write `MODEL_ARCH=yolox` in .env without specifying a
-    filename and get a sensible default.
-
-    Args:
-        model_arch: The model architecture enum value
-
-    Returns:
-        Default filename for that architecture (e.g. "yolov8n.pt")
+    Lets users set only MODEL_ARCH in .env and get a working default.
 
     Raises:
-        ModelConfigError: If model_arch has no known default
+        ModelConfigError: If no default exists for this architecture.
     """
-    defaults = {
-        ModelType.ULTRALYTICS: "yolov8n.pt",
-        ModelType.YOLO_ONNX: "yolov8n.onnx",
-        ModelType.YOLOX: "yolox_nano.onnx",
-        ModelType.RFDETR: "rfdetr_r18vd.onnx",
-        ModelType.DFINE: "dfine_n_coco.onnx",
-        ModelType.OPENVINO: "person-detection-retail-0013.xml",
-    }
-
-    if model_arch not in defaults:
+    try:
+        return _ARCH_DEFAULTS[model_arch]
+    except KeyError:
         raise ModelConfigError(
-            f"Cannot infer default filename for architecture '{model_arch}'. "
-            f"Set MODEL_ID explicitly in .env, or use one of: "
-            f"{[m.value for m in ModelType]}",
-            context={"model_arch": str(model_arch)}
+            f"No default filename for architecture '{model_arch.value}'. "
+            f"Set MODEL_ID explicitly in .env.",
+            context={"model_arch": model_arch.value,
+                     "known": [m.value for m in ModelType]},
         )
 
-    return defaults[model_arch]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model ID parsing — turns "MODEL_ID + MODEL_ARCH" settings into a relative path
-# ─────────────────────────────────────────────────────────────────────────────
-
-def model_id_provider(model_id: str, model_arch: ModelType | None) -> tuple[str, ModelType]:
+def model_id_provider(
+    model_id: str,
+    model_arch: Optional[ModelType],
+) -> tuple[str, ModelType]:
     """
-    Resolve (MODEL_ID, MODEL_ARCH) settings into a relative model path
-    of the form "{arch}/{filename}".
+    Resolve (MODEL_ID, MODEL_ARCH) into a relative model path and concrete arch.
 
-    This function exists because users configure models in .env in several
-    different ways depending on what they already know:
-      - Only MODEL_ARCH set        -> use the default filename for that arch
-      - MODEL_ID is just a filename + MODEL_ARCH set -> combine them
-      - MODEL_ID is "arch/filename" -> use as-is (or override with MODEL_ARCH)
-      - MODEL_ID is just an arch name (e.g. "ultralytics") -> treat as arch selector
+    Handles four .env patterns users actually write:
+      1. MODEL_ARCH only          → "<arch>/<default_file>"
+      2. MODEL_ID=<filename>      → "<arch>/<filename>"  (MODEL_ARCH required)
+      3. MODEL_ID=<arch>          → "<arch>/<default_file>"
+      4. MODEL_ID=<arch>/<file>   → "<arch>/<file>"
 
     Args:
-        model_id: Raw MODEL_ID string from settings (may be empty)
-        model_arch: MODEL_ARCH enum from settings (may be None)
+        model_id:   Raw MODEL_ID string from settings (may be empty/None).
+        model_arch: MODEL_ARCH enum from settings (may be None).
 
     Returns:
-        (relative_path, resolved_arch) e.g. ("ultralytics/yolov8n.pt", ModelType.ULTRALYTICS)
+        (relative_path, resolved_arch)
+        e.g. ("ultralytics/yolov8n.pt", ModelType.ULTRALYTICS)
 
     Raises:
-        ModelConfigError: If the combination of settings is ambiguous or invalid
+        ModelConfigError: If the combination is ambiguous or invalid.
     """
-    mid = model_id.strip() if model_id else ""
-    valid_arch_dirs = {m.value for m in ModelType}
+    mid           = (model_id or "").strip()
+    valid_arch_values = {m.value: m for m in ModelType}
 
-    # ── Case 1: No MODEL_ID at all ──
+    # ── Case 1: No MODEL_ID ───────────────────────────────────────────────────
     if not mid:
         if model_arch is None:
             raise ModelConfigError(
-                "Both MODEL_ID and MODEL_ARCH are empty in settings. "
-                "Set at least MODEL_ARCH (e.g. MODEL_ARCH=ultralytics)."
+                "Both MODEL_ID and MODEL_ARCH are unset. "
+                "Set at least MODEL_ARCH in .env (e.g. MODEL_ARCH=yolo_onnx)."
             )
-        filename = _infer_default_filename(model_arch)
-        return f"{model_arch.value}/{filename}", model_arch
+        return f"{model_arch.value}/{_default_filename(model_arch)}", model_arch
 
-    parts = mid.rsplit("/", 1)
+    # ── Case 2 / 3: No slash — bare filename or bare arch name ───────────────
+    if "/" not in mid:
+        if mid in valid_arch_values:
+            # MODEL_ID="ultralytics" — treat as arch selector
+            arch = model_arch or valid_arch_values[mid]
+            return f"{arch.value}/{_default_filename(arch)}", arch
 
-    # ── Case 2: MODEL_ID has no "/" — it's either a bare filename or an arch name ──
-    if len(parts) == 1:
-        if mid in valid_arch_dirs:
-            # MODEL_ID is itself an arch name, e.g. MODEL_ID="ultralytics"
-            final_arch = model_arch if model_arch is not None else ModelType(mid)
-            filename = _infer_default_filename(final_arch)
-            return f"{final_arch.value}/{filename}", final_arch
-
-        # MODEL_ID is a bare filename, e.g. MODEL_ID="yolov8n.pt"
+        # MODEL_ID="yolov8n.pt" — bare filename, MODEL_ARCH must be set
         if model_arch is None:
             raise ModelConfigError(
-                f"MODEL_ID='{mid}' looks like a filename, but MODEL_ARCH is not set "
-                f"so the model folder cannot be determined. "
-                f"Either set MODEL_ARCH, or use MODEL_ID='<arch>/{mid}'.",
-                context={"model_id": mid}
+                f"MODEL_ID='{mid}' looks like a filename but MODEL_ARCH is not set. "
+                f"Either add MODEL_ARCH=<arch> or use MODEL_ID=<arch>/{mid}.",
+                context={"model_id": mid},
             )
         return f"{model_arch.value}/{mid}", model_arch
 
-    # ── Case 3: MODEL_ID contains "/" — "folder/filename" or "org/repo" ──
-    current_dir, current_file = parts[0], parts[1]
+    # ── Case 4: Contains slash — "folder/filename" ────────────────────────────
+    folder, filename = mid.rsplit("/", 1)
 
     if model_arch is not None:
-        # Explicit MODEL_ARCH always wins over whatever folder is in MODEL_ID
-        return f"{model_arch.value}/{current_file}", model_arch
+        # Explicit MODEL_ARCH always wins over the folder in MODEL_ID
+        return f"{model_arch.value}/{filename}", model_arch
 
-    if current_dir in valid_arch_dirs:
-        return mid, ModelType(current_dir)
+    if folder in valid_arch_values:
+        return mid, valid_arch_values[folder]
 
-    # Unknown folder and no MODEL_ARCH — this is a configuration error, not
-    # something we should silently paper over by defaulting to OpenVINO.
     raise ModelConfigError(
-        f"MODEL_ID='{mid}' has folder '{current_dir}' which is not a known "
-        f"architecture, and MODEL_ARCH is not set. "
-        f"Known architectures: {sorted(valid_arch_dirs)}",
-        context={"model_id": mid, "unknown_folder": current_dir}
+        f"MODEL_ID='{mid}' has unknown folder '{folder}' and MODEL_ARCH is not set. "
+        f"Known architectures: {sorted(valid_arch_values)}",
+        context={"model_id": mid, "unknown_folder": folder},
     )
 
 
@@ -159,61 +147,67 @@ def model_id_provider(model_id: str, model_arch: ModelType | None) -> tuple[str,
 # Download helpers — one per source
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_ultralytics_model(model_id: str, target_onnx_path: str) -> str:
+def _download_ultralytics(model_id: str, target_onnx_path: str) -> str:
     """
-    Download an Ultralytics .pt model (via the ultralytics package, which
-    handles its own caching/downloading) and export it to ONNX.
+    Download an Ultralytics .pt model and export it to ONNX.
+
+    The ultralytics package handles its own weight caching/downloading.
+    The resulting .onnx is moved to *target_onnx_path*.
 
     Args:
-        model_id: Ultralytics model name, e.g. "yolov8n.pt" or "yolov8n"
-        target_onnx_path: Where the final .onnx file should end up
+        model_id:        Ultralytics model name, e.g. "yolov8n" or "yolov8n.pt".
+        target_onnx_path: Absolute path where the .onnx file should land.
 
     Returns:
-        target_onnx_path (the .onnx file now exists at this path)
+        target_onnx_path
 
     Raises:
-        ModelDownloadError: If download or export fails
+        ModelDownloadError: If download or export fails.
     """
-    from ultralytics import YOLO
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        raise ModelDownloadError(
+            "ultralytics package not installed — cannot download/export YOLO model. "
+            "Run: pip install ultralytics",
+            context={"model_id": model_id},
+        )
 
-    pt_path = target_onnx_path.replace(".onnx", ".pt")
-    logger.info(f"Downloading Ultralytics model '{model_id}' (will export to ONNX)")
-
+    logger.info(f"Downloading Ultralytics model '{model_id}' and exporting to ONNX")
     try:
         os.makedirs(os.path.dirname(target_onnx_path), exist_ok=True)
 
-        # YOLO(...) downloads the .pt weights via ultralytics' own cache if not present
-        model = YOLO(model_id, task="detect")
-
+        model       = YOLO(model_id, task="detect")
         export_args = {
-            "format": "onnx",
-            "imgsz": settings.FRAME_SHAPE[:2],  # (H, W) — match the pipeline's working resolution
-            "dynamic": True,                     # required for batched inference
+            "format":   "onnx",
+            "imgsz":    settings.FRAME_SHAPE[:2],  # (H, W) — match pipeline resolution
+            "dynamic":  True,                       # required for predict_batch()
             "simplify": True,
-            "opset": 13,
+            "opset":    13,
         }
-        exported_path = model.export(**export_args)
+        exported = model.export(**export_args)
 
-        if not exported_path or not os.path.exists(exported_path):
+        if not exported or not os.path.exists(str(exported)):
             raise ModelDownloadError(
                 "Ultralytics export() did not produce an output file",
-                context={"model_id": model_id, "export_args": export_args}
+                context={"model_id": model_id, "export_args": export_args},
             )
 
-        # Move the exported .onnx to where resolve_model_path() expects it
-        if os.path.abspath(exported_path) != os.path.abspath(target_onnx_path):
-            shutil.move(exported_path, target_onnx_path)
+        # Move to the expected location if ultralytics placed it elsewhere
+        if os.path.abspath(str(exported)) != os.path.abspath(target_onnx_path):
+            shutil.move(str(exported), target_onnx_path)
 
-        # Optionally keep the .pt for future re-exports
-        pt_source = str(model.ckpt_path) if hasattr(model, "ckpt_path") and model.ckpt_path else None
-        if pt_source and os.path.exists(pt_source):
+        # Cache the .pt alongside the .onnx for future re-exports
+        pt_path = target_onnx_path.replace(".onnx", ".pt")
+        ckpt    = getattr(model, "ckpt_path", None)
+        if ckpt and os.path.exists(str(ckpt)):
             try:
-                shutil.copy(pt_source, pt_path)
-            except OSError as e:
-                logger.warning(f"Could not cache .pt file alongside .onnx: {e}")
+                shutil.copy(str(ckpt), pt_path)
+            except OSError as err:
+                logger.warning(f"Could not cache .pt alongside .onnx: {err}")
 
         del model
-        logger.success(f"Ultralytics model exported to ONNX: {target_onnx_path}")
+        logger.success(f"Ultralytics model exported → {target_onnx_path}")
         return target_onnx_path
 
     except ModelDownloadError:
@@ -221,96 +215,186 @@ def _process_ultralytics_model(model_id: str, target_onnx_path: str) -> str:
     except Exception as e:
         raise ModelDownloadError(
             f"Failed to download/export Ultralytics model '{model_id}'",
-            context={"model_id": model_id, "error": str(e)}
+            context={"model_id": model_id, "error": str(e)},
         ) from e
 
 
-def download_yolox_from_github(url: str, destination_path: str, timeout: int = 30) -> str:
+def _download_yolox_github(url: str, destination: str, timeout: int = 60) -> str:
     """
-    Download a YOLOX ONNX model from its GitHub releases page.
+    Download a YOLOX ONNX file from its GitHub releases page.
+
+    Uses a .part temporary file so a failed download never leaves a
+    corrupted file at *destination*.
 
     Args:
-        url: Full download URL
-        destination_path: Local path to save the file
-        timeout: Request timeout in seconds
+        url:         Full download URL.
+        destination: Local path for the final .onnx file.
+        timeout:     HTTP request timeout in seconds.
 
     Returns:
-        destination_path (the file now exists at this path)
+        destination
 
     Raises:
-        ModelDownloadError: If the download fails
+        ModelDownloadError: If the HTTP request fails.
     """
-    logger.info(f"Downloading YOLOX model from {url}")
-
+    logger.info(f"Downloading YOLOX model | url={url}")
+    tmp = destination + ".part"
     try:
-        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-        tmp_dest = destination_path + ".part"
-
-        with requests.get(url, stream=True, timeout=timeout) as response:
-            response.raise_for_status()
-            with open(tmp_dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        with requests.get(url, stream=True, timeout=timeout) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            done  = 0
+            with open(tmp, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65_536):
                     if chunk:
-                        f.write(chunk)
-
-        shutil.move(tmp_dest, destination_path)
-        logger.success(f"Downloaded YOLOX model to {destination_path}")
-        return destination_path
+                        fh.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            logger.debug(
+                                f"YOLOX download: {done/1024/1024:.1f} MB "
+                                f"/ {total/1024/1024:.1f} MB"
+                            )
+        shutil.move(tmp, destination)
+        logger.success(f"YOLOX model downloaded → {destination}")
+        return destination
 
     except requests.RequestException as e:
         raise ModelDownloadError(
-            f"Failed to download YOLOX model from GitHub",
-            context={"url": url, "error": str(e)}
+            "Failed to download YOLOX model from GitHub",
+            context={"url": url, "error": str(e)},
         ) from e
+    finally:
+        # Always clean up the .part file on failure
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
-def download_from_hf(repo_id: str, final_local_dir: str, model_file_path: str) -> str:
+def _download_from_hf(
+    repo_id: str,
+    hf_filename: str,
+    final_path: str,
+    local_dir: str,
+) -> str:
     """
-    Download a model file from a HuggingFace Hub repository.
+    Download a model file from HuggingFace Hub.
 
     Args:
-        repo_id: HuggingFace repo ID, e.g. "onnx-community/rfdetr"
-        final_local_dir: Directory to download into
-        model_file_path: Final path the model file should end up at
+        repo_id:    HF repo, e.g. "onnx-community/rfdetr_small-ONNX".
+        hf_filename: Path inside the repo, e.g. "onnx/model_quantized.onnx".
+        final_path: Absolute local path where the file should end up.
+        local_dir:  Directory for hf_hub_download to place the file.
 
     Returns:
-        model_file_path (the file now exists at this path)
+        final_path
 
     Raises:
-        ModelDownloadError: If the download or move fails
+        ModelDownloadError: If the download or move fails.
     """
-    filename = settings.HF_MODEL_FILENAME or "onnx/model_quantized.onnx"
-    logger.info(f"Downloading '{filename}' from HuggingFace Hub repo '{repo_id}'")
+    # Split "subfolder/filename" if present
+    if "/" in hf_filename:
+        subfolder, filename = hf_filename.rsplit("/", 1)
+    else:
+        subfolder, filename = None, hf_filename
 
+    logger.info(
+        f"Downloading from HF Hub | repo={repo_id} "
+        f"| file={hf_filename}"
+    )
     try:
-        downloaded_path = hf_hub_download(
+        downloaded = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
+            subfolder=subfolder,
             cache_dir=os.path.join(settings.BASE_DIR, "hf_cache"),
-            local_dir=final_local_dir,
+            local_dir=local_dir,
             local_dir_use_symlinks=False,
         )
-        logger.success(f"Downloaded from HF Hub to {downloaded_path}")
+        logger.success(f"HF download complete → {downloaded}")
 
     except Exception as e:
         raise ModelDownloadError(
-            f"Failed to download '{filename}' from HF Hub repo '{repo_id}'",
-            context={"repo_id": repo_id, "filename": filename, "error": str(e)}
+            f"Failed to download '{hf_filename}' from HF Hub repo '{repo_id}'",
+            context={"repo_id": repo_id, "filename": hf_filename, "error": str(e)},
         ) from e
 
-    # Move into the expected final location, if different
-    if os.path.abspath(downloaded_path) != os.path.abspath(model_file_path):
+    # Move to the canonical final path if hf_hub placed it elsewhere
+    if os.path.abspath(downloaded) != os.path.abspath(final_path):
         try:
-            os.makedirs(os.path.dirname(model_file_path), exist_ok=True)
-            shutil.move(downloaded_path, model_file_path)
-            logger.success(f"Moved model to {model_file_path}")
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            shutil.move(downloaded, final_path)
+            logger.success(f"Model moved → {final_path}")
         except OSError as e:
             raise ModelDownloadError(
-                f"Downloaded model but failed to move it into place",
-                context={"from": downloaded_path, "to": model_file_path, "error": str(e)}
+                "Downloaded from HF Hub but failed to move file into place",
+                context={"from": downloaded, "to": final_path, "error": str(e)},
             ) from e
 
-    return model_file_path
+    return final_path
+
+
+def _download_openvino(precision: str, destination_dir: str) -> str:
+    """
+    Download person-detection-retail-0013 (.xml + .bin) from Intel Open Model Zoo.
+
+    Both files MUST be present for OpenVINO to load the model — the function
+    raises ModelDownloadError if either file fails.
+
+    Args:
+        precision:       Model precision variant: "FP32", "FP16", or "FP16-INT8".
+        destination_dir: Directory where .xml and .bin will be saved.
+
+    Returns:
+        Absolute path to the .xml file (the model entry point).
+
+    Raises:
+        ModelDownloadError: If either file cannot be downloaded.
+    """
+    model_name = "person-detection-retail-0013"
+    files      = [f"{model_name}.xml", f"{model_name}.bin"]
+    base_url   = f"{_OPENVINO_OMZ_BASE}/{precision}"
+
+    logger.info(
+        f"Downloading OpenVINO model | precision={precision} "
+        f"| destination={destination_dir}"
+    )
+    os.makedirs(destination_dir, exist_ok=True)
+
+    for filename in files:
+        url       = f"{base_url}/{filename}"
+        dest_path = os.path.join(destination_dir, filename)
+        tmp_path  = dest_path + ".part"
+
+        logger.info(f"Fetching {url}")
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp, \
+                 open(tmp_path, "wb") as fh:
+                fh.write(resp.read())
+            shutil.move(tmp_path, dest_path)
+            size_kb = os.path.getsize(dest_path) / 1024
+            logger.success(f"Downloaded {filename} ({size_kb:.0f} KB)")
+
+        except Exception as e:
+            # Clean up partial file before raising
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise ModelDownloadError(
+                f"Failed to download OpenVINO model file '{filename}'",
+                context={"url": url, "error": str(e)},
+            ) from e
+
+    xml_path = os.path.join(destination_dir, f"{model_name}.xml")
+    logger.success(f"OpenVINO model ready → {xml_path}")
+    return xml_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,68 +404,106 @@ def download_from_hf(repo_id: str, final_local_dir: str, model_file_path: str) -
 @lru_cache(maxsize=8)
 def resolve_model_path() -> str:
     """
-    Resolve settings.MODEL_ID / settings.MODEL_ARCH into an absolute local
-    path to a usable model file, downloading it if necessary.
+    Resolve settings into an absolute path to a usable model file.
 
-    Cached with lru_cache — settings don't change at runtime, and this
-    touches the filesystem/network, so repeated calls (e.g. one per camera
-    using the same model) should not re-resolve from scratch.
+    Checks for a local copy first; downloads if missing.
+    Cached with lru_cache so repeated calls (e.g. one per camera subprocess
+    using the same model) skip redundant filesystem/network operations.
 
     Returns:
-        Absolute path to the model file (guaranteed to exist on success)
+        Absolute path to the model file (guaranteed to exist on return).
 
     Raises:
-        ModelConfigError: If MODEL_ID/MODEL_ARCH settings are invalid
-        ModelDownloadError: If the model needs downloading and that fails
-        ModelResolutionError: For any other unexpected resolution failure
+        ModelConfigError:     MODEL_ID / MODEL_ARCH settings are invalid.
+        ModelDownloadError:   Download or export failed.
+        ModelResolutionError: No download strategy for this architecture,
+                              or any other unexpected resolution failure.
     """
-    model_id = settings.MODEL_ID
+    model_id   = settings.MODEL_ID
     model_arch = settings.MODEL_ARCH
 
+    # ── 1. Parse settings into a relative path ──────────────────────────────
     try:
         relative_path, model_arch = model_id_provider(model_id, model_arch)
     except ModelConfigError:
-        raise  # already has a clear message, just propagate
+        raise
 
-    # HuggingFace models (DFINE/RFDETR) live under a shared repo directory
-    repo_id = relative_path.rsplit("/", 1)[0]
-    repo_name = settings.HF_MODEL_REPONAME
-    if repo_name and model_arch in (ModelType.DFINE, ModelType.RFDETR):
-        relative_path = relative_path.replace(repo_id, repo_name)
-        repo_id = repo_name
+    logger.debug(
+        f"Resolving model | id={model_id!r} | arch={model_arch.value} "
+        f"| relative={relative_path}"
+    )
 
-    final_local_dir = os.path.join(settings.BASE_DIR, "models", repo_id)
-    model_file_path = os.path.join(settings.BASE_DIR, "models", relative_path)
-    os.makedirs(final_local_dir, exist_ok=True)
+    # ── 2. Build absolute paths ──────────────────────────────────────────────
+    models_root   = os.path.join(settings.BASE_DIR, "models")
+    model_dir     = os.path.join(models_root, relative_path.rsplit("/", 1)[0])
+    model_file    = os.path.join(models_root, relative_path)
 
-    # ── Already exists locally — done ──
-    if os.path.exists(model_file_path):
-        logger.info(f"Using local model: {model_file_path}")
-        return model_file_path
+    # HF models nest an extra subfolder (e.g. "onnx/model_quantized.onnx")
+    hf_filename   = settings.HF_MODEL_FILENAME or "onnx/model_quantized.onnx"
+    hf_model_file = os.path.join(models_root, relative_path, hf_filename)
 
-    logger.info(f"Model '{model_id}' (arch={model_arch.value}) not found locally "
-               f"at {model_file_path} — attempting to download")
+    # OpenVINO needs .xml at a predictable path inside the model dir
+    ov_xml_file   = os.path.join(
+        models_root, relative_path, "person-detection-retail-0013.xml"
+    )
 
-    if model_arch == ModelType.ULTRALYTICS or model_arch == ModelType.YOLO_ONNX:
-        return _process_ultralytics_model(model_id, model_file_path)
+    os.makedirs(model_dir, exist_ok=True)
 
-    elif model_arch == ModelType.YOLOX:
-        yolox_url = YOLOX_GITHUB_BASE_URL + os.path.basename(relative_path)
-        return download_yolox_from_github(yolox_url, model_file_path)
+    # ── 3. Return immediately if already local ───────────────────────────────
+    if model_arch == ModelType.OPENVINO:
+        if os.path.exists(ov_xml_file):
+            logger.info(f"Using local OpenVINO model: {ov_xml_file}")
+            return ov_xml_file
 
     elif model_arch in (ModelType.DFINE, ModelType.RFDETR):
-        return download_from_hf(model_id, final_local_dir, model_file_path)
+        if os.path.exists(hf_model_file):
+            logger.info(f"Using local HF model: {hf_model_file}")
+            return hf_model_file
+
+    else:
+        # YOLO ONNX, YOLOX, Ultralytics — single file at model_file
+        if os.path.exists(model_file):
+            logger.info(f"Using local model: {model_file}")
+            return model_file
+
+    # ── 4. Download ──────────────────────────────────────────────────────────
+    logger.info(
+        f"Model not found locally — downloading | "
+        f"arch={model_arch.value} | id={model_id!r}"
+    )
+
+    if model_arch in (ModelType.ULTRALYTICS, ModelType.YOLO_ONNX):
+        return _download_ultralytics(model_id, model_file)
+
+    elif model_arch == ModelType.YOLOX:
+        filename  = os.path.basename(relative_path)
+        yolox_url = _YOLOX_GITHUB_BASE + filename
+        return _download_yolox_github(yolox_url, model_file)
+
+    elif model_arch in (ModelType.DFINE, ModelType.RFDETR):
+        hf_local_dir = os.path.join(models_root, relative_path)
+        os.makedirs(
+            os.path.join(hf_local_dir, hf_filename.split("/")[0]),
+            exist_ok=True
+        )
+        return _download_from_hf(
+            repo_id=relative_path,
+            hf_filename=hf_filename,
+            final_path=hf_model_file,
+            local_dir=hf_local_dir,
+        )
 
     elif model_arch == ModelType.OPENVINO:
-        raise ModelResolutionError(
-            f"OpenVINO model not found at {model_file_path} and OpenVINO "
-            f"models have no auto-download source. Place the .xml/.bin "
-            f"files there manually.",
-            context={"expected_path": model_file_path}
-        )
+        # precision comes from MODEL_ID when OpenVINO arch is selected
+        # e.g. MODEL_ID=FP16  or  MODEL_ID=FP32
+        precision    = model_id.upper() if model_id.upper() in ("FP32", "FP16", "FP16-INT8") \
+                       else "FP16"
+        ov_model_dir = os.path.join(models_root, relative_path)
+        return _download_openvino(precision, ov_model_dir)
 
     else:
         raise ModelResolutionError(
-            f"No download strategy implemented for architecture '{model_arch}'",
-            context={"model_arch": str(model_arch), "model_id": model_id}
+            f"No download strategy for architecture '{model_arch.value}'. "
+            f"Place the model file manually at: {model_file}",
+            context={"model_arch": model_arch.value, "expected_path": model_file},
         )

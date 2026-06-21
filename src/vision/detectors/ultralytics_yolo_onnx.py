@@ -135,7 +135,6 @@ class UltralyticsONNXDetector(BaseDetector):
             boxes_xywh = boxes_xywh[mask]
             max_scores = max_scores[mask]
             class_ids = np.argmax(scores[mask], axis=1)
-
             # Convert CXCYWH (model output) → XYXY (supervision format)
             cx, cy, w, h = boxes_xywh[:, 0], boxes_xywh[:, 1], boxes_xywh[:, 2], boxes_xywh[:, 3]
             x1 = cx - w / 2

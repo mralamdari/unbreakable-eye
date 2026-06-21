@@ -1,6 +1,16 @@
 """
 YOLOX detector using ONNX Runtime.
-Best for: Edge devices, models with pre-calculated anchor grids.
+
+YOLOX-specific characteristics:
+  - Input: raw 0-255 BGR pixels (NOT normalized, NOT divided by 255)
+  - Preprocessing: aspect-ratio-preserving resize + top-left padding (pad=114)
+  - Output: (1, N, 5+num_classes) where N = Σ (H/s * W/s) for s in [8,16,32]
+  - Decoding: grid-cell offsets + strides computed per-call (can't pre-cache
+    because grid depends on input shape which is always the same, but the
+    decode uses mutable in-place ops on the output tensor)
+  - NMS: class-agnostic via nms_numpy() in utils
+
+Reference: https://github.com/Megvii-BaseDetection/YOLOX
 """
 
 import os
@@ -8,237 +18,235 @@ import cv2
 import numpy as np
 import supervision as sv
 from loguru import logger
-from typing import Tuple
+from typing import Optional, Tuple
 
+from src.core.config import settings
 from src.vision.base import BaseDetector
-from src.vision.utils import create_session, letterbox, normalize_simple, to_chw_float32, apply_nms_opencv
-from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError
+from src.vision.utils import create_session, nms_numpy
+from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError, PostprocessError
+
+
+def _multiclass_nms_class_agnostic(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    nms_thresh: float,
+    score_thresh: float,
+) -> Optional[np.ndarray]:
+    """
+    Class-agnostic NMS matching YOLOX's official demo_utils.py behaviour.
+
+    Args:
+        boxes:        (N, 4) float32 [x1, y1, x2, y2] in original image pixels.
+        scores:       (N, num_classes) float32 — objectness * class probabilities.
+        nms_thresh:   IoU suppression threshold.
+        score_thresh: Minimum confidence to even enter NMS.
+
+    Returns:
+        (K, 6) array [x1, y1, x2, y2, score, class_id], or None if no survivors.
+    """
+    cls_inds   = scores.argmax(axis=1)
+    cls_scores = scores[np.arange(len(cls_inds)), cls_inds]
+
+    valid      = cls_scores > score_thresh
+    if not valid.any():
+        return None
+
+    valid_boxes  = boxes[valid]
+    valid_scores = cls_scores[valid]
+    valid_cls    = cls_inds[valid]
+
+    keep = nms_numpy(valid_boxes, valid_scores, nms_thresh)
+    if len(keep) == 0:
+        return None
+
+    return np.concatenate([
+        valid_boxes[keep],
+        valid_scores[keep, np.newaxis],
+        valid_cls[keep, np.newaxis],
+    ], axis=1)
 
 
 class YOLOXDetector(BaseDetector):
-    """
-    YOLOX detector with optimized anchor grid pre-calculation.
-    Avoids recalculating grid positions every frame.
-    """
+    """YOLOX object detector via ONNX Runtime."""
 
     def __init__(
         self,
         model_path: str,
         conf_thresh: float = 0.45,
-        nms_thresh: float = 0.45,
-        class_agnostic: bool = True
+        nms_thresh:  float = 0.45,
+        class_agnostic: bool = True,
     ):
         """
         Args:
-            model_path: Path to YOLOX .onnx model
-            conf_thresh: Confidence threshold
-            nms_thresh: NMS IOU threshold
-            class_agnostic: Use class-agnostic NMS
+            model_path:     Path to YOLOX .onnx model file.
+            conf_thresh:    Minimum confidence score to keep a detection.
+            nms_thresh:     IoU threshold for NMS suppression.
+            class_agnostic: If True, use class-agnostic NMS (YOLOX default).
 
         Raises:
-            ModelLoadError: If model cannot be loaded
+            ModelLoadError: If the ONNX session cannot be created.
         """
-        self.conf_thresh = conf_thresh
-        self.nms_thresh = nms_thresh
+        self.conf_thresh    = conf_thresh
+        self.nms_thresh     = nms_thresh
         self.class_agnostic = class_agnostic
 
         try:
             num_threads = max(1, (os.cpu_count() or 4) // 2 - 1)
-            logger.info(f"Creating YOLOX ONNX session with {num_threads} threads")
-            self.session = create_session(model_path, num_threads=num_threads)
+            logger.info(f"Loading YOLOX ONNX | path={model_path} | threads={num_threads}")
+            self.session    = create_session(model_path, num_threads=num_threads)
             self.input_name = self.session.get_inputs()[0].name
 
-            # Get model input shape
-            # self.input_size = settings.FRAME_SHAPE  # (H, W, C)
-            # self.input_h, self.input_w, _ = self.input_size
-            shape = self.session.get_inputs()[0].shape
-            self.input_h = shape[2] if isinstance(shape[2], int) else 640
-            self.input_w = shape[3] if isinstance(shape[3], int) else 640
+            shape        = self.session.get_inputs()[0].shape  # [1, 3, H, W]
+            self.input_h = int(shape[2]) if isinstance(shape[2], int) else 640
+            self.input_w = int(shape[3]) if isinstance(shape[3], int) else 640
+            self.input_size = (self.input_h, self.input_w)
 
-            logger.info(f"YOLOX model initialized: input {self.input_h}x{self.input_w}")
-
-            # Pre-calculate grids (expensive operation, do once)
-            self._generate_grids()
-
-        except Exception as e:
-            logger.error(f"Failed to initialize YOLOX detector: {e}")
-            raise ModelLoadError(
-                f"Failed to initialize YOLOX detector",
-                context={"model_path": model_path, "error": str(e)}
-            ) from e
-
-    def _generate_grids(self):
-        """
-        Pre-calculate anchor grids for all scales.
-        YOLOX optimization: avoid grid recalculation every frame.
-        
-        Grids are used to decode center offsets into absolute coordinates.
-        """
-        strides = [8, 16, 32]  # Multi-scale pyramid
-        self.grids = []
-        self.expanded_strides = []
-
-        for stride in strides:
-            # Create a grid of positions at this scale
-            hsize = self.input_h // stride
-            wsize = self.input_w // stride
-            
-            xv, yv = np.meshgrid(np.arange(wsize), np.arange(hsize))
-            grid = np.stack((xv, yv), 2).reshape(1, -1, 2)
-            
-            self.grids.append(grid)
-            self.expanded_strides.append(np.full((*grid.shape[:2], 1), stride))
-
-        self.grids = np.concatenate(self.grids, 1)
-        self.expanded_strides = np.concatenate(self.expanded_strides, 1)
-        logger.debug(f"YOLOX grids pre-calculated: {self.grids.shape}")
-
-    def preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
-        """
-        Preprocess frame for YOLOX inference.
-
-        Args:
-            frame: Input BGR image
-
-        Returns:
-            (input_blob, ratio) where input_blob is (1, 3, H, W) and
-            ratio is the scale factor for rescaling boxes
-
-        Raises:
-            PreprocessError: If preprocessing fails
-        """
-        try:
-            # Letterbox with aspect ratio preservation
-            img_padded, _ = letterbox(
-                frame, self.input_h, self.input_w, pad_value=0  # YOLOX uses black padding
+            logger.info(
+                f"YOLOX ready | input={self.input_h}x{self.input_w} "
+                f"| conf={conf_thresh} | nms={nms_thresh}"
             )
 
-            # YOLOX normalization: simple 0-1 scaling
-            img_norm = normalize_simple(img_padded)
+        except ModelLoadError:
+            raise
+        except Exception as e:
+            raise ModelLoadError(
+                "Failed to initialise YOLOX detector",
+                context={"model_path": model_path, "error": str(e)},
+            ) from e
 
-            # HWC → CHW
-            img_chw = np.transpose(img_norm, (2, 0, 1))
+    # ── Preprocessing ─────────────────────────────────────────────────────────
 
-            # Add batch dimension
-            blob = np.expand_dims(img_chw, axis=0).astype(np.float32)
+    def preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Resize with aspect-ratio preservation + top-left padding.
 
-            # Calculate ratio for rescaling boxes back to original space
-            h, w = frame.shape[:2]
-            scale = min(self.input_h / h, self.input_w / w)
-            ratio = 1.0 / scale
+        YOLOX expects raw 0-255 BGR pixel values — no /255, no mean/std.
 
-            return np.ascontiguousarray(blob), ratio
+        Args:
+            img: BGR uint8 image (any resolution).
+
+        Returns:
+            blob:  (1, 3, input_h, input_w) float32 — raw pixel values.
+            ratio: scale factor used; divide decoded box coords by this.
+
+        Raises:
+            PreprocessError: If preprocessing fails.
+        """
+        try:
+            ih, iw = img.shape[:2]
+            ratio   = min(self.input_h / ih, self.input_w / iw)
+            new_h   = int(ih * ratio)
+            new_w   = int(iw * ratio)
+
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            # Top-left padding with gray (114) — matches YOLOX training aug
+            canvas = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
+            canvas[:new_h, :new_w] = resized
+
+            # CHW, float32, raw 0-255 — NO normalization
+            blob = canvas.transpose(2, 0, 1).astype(np.float32)
+            blob = np.ascontiguousarray(blob[np.newaxis])  # (1, 3, H, W)
+            return blob, ratio
 
         except Exception as e:
-            logger.error(f"YOLOX preprocessing failed: {e}")
             raise PreprocessError(
                 "YOLOX preprocessing failed",
-                context={"image_shape": frame.shape, "error": str(e)}
+                context={"image_shape": list(img.shape), "error": str(e)},
             ) from e
 
-    def postprocess(
-        self,
-        outputs: np.ndarray,
-        ratio: float
-    ) -> sv.Detections:
+    # ── Grid decoding ─────────────────────────────────────────────────────────
+
+    def _decode_outputs(self, outputs: np.ndarray) -> np.ndarray:
         """
-        Decode YOLOX raw output and apply NMS.
+        Decode raw YOLOX network output from grid-cell space to image pixels.
+
+        YOLOX outputs center offsets relative to grid cells and log-scale
+        width/height. This function maps them to absolute coordinates on the
+        (input_h, input_w) canvas — caller then divides by ratio to get
+        original-image coordinates.
 
         Args:
-            outputs: Model output shape (1, 8400, 85) — batch, anchors, xywh+obj+classes
-            ratio: Scale ratio for rescaling boxes
+            outputs: (1, N, 5+num_classes) raw ONNX output.
 
         Returns:
-            sv.Detections with detected objects
-
-        Raises:
-            PostprocessError: If postprocessing fails
+            (N, 5+num_classes) float32 with xy decoded to absolute canvas pixels.
         """
-        try:
-            # outputs is (batch=1, num_anchors, features=85)
-            outputs = outputs[0]  # Remove batch dimension → (num_anchors, 85)
+        grids, strides_exp = [], []
+        for stride in ([8, 16, 32]):
+            hs = self.input_h // stride
+            ws = self.input_w // stride
+            xv, yv = np.meshgrid(np.arange(ws), np.arange(hs))
+            grid   = np.stack((xv, yv), axis=2).reshape(1, -1, 2)
+            grids.append(grid)
+            strides_exp.append(np.full((*grid.shape[:2], 1), stride))
 
-            # Decode boxes using pre-calculated grids
-            # YOLOX output is: [dx, dy, dw, dh, objectness, class_scores...]
-            # xy = (raw_xy + grid) * stride
-            outputs[:, :2] = (outputs[:, :2] + self.grids[0]) * self.expanded_strides[0]
-            # wh = exp(raw_wh) * stride
-            outputs[:, 2:4] = np.exp(outputs[:, 2:4]) * self.expanded_strides[0]
+        grids       = np.concatenate(grids, axis=1)
+        strides_exp = np.concatenate(strides_exp, axis=1)
 
-            # Extract boxes and scores
-            boxes = outputs[:, :4]  # [cx, cy, w, h]
-            obj_conf = outputs[:, 4:5]  # Objectness
-            cls_scores = outputs[:, 5:]  # Class scores
+        out = outputs.copy()
+        out[..., :2] = (out[..., :2] + grids) * strides_exp   # cx, cy
+        out[..., 2:4] = np.exp(out[..., 2:4]) * strides_exp   # w, h
+        return out[0]  # remove batch dim → (N, 5+C)
 
-            # Combine objectness + class scores
-            scores = obj_conf * cls_scores
-
-            # Get class ID and max score for each anchor
-            class_ids = np.argmax(scores, axis=1)
-            max_scores = np.max(scores, axis=1)
-
-            # Filter by confidence
-            mask = max_scores > self.conf_thresh
-            if not np.any(mask):
-                return sv.Detections.empty()
-
-            boxes = boxes[mask]
-            max_scores = max_scores[mask]
-            class_ids = class_ids[mask]
-
-            # Convert CXCYWH → XYXY
-            x1 = boxes[:, 0] - boxes[:, 2] / 2
-            y1 = boxes[:, 1] - boxes[:, 3] / 2
-            x2 = boxes[:, 0] + boxes[:, 2] / 2
-            y2 = boxes[:, 1] + boxes[:, 3] / 2
-
-            boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1) / ratio
-
-            # Apply NMS using OpenCV (YOLOX tradition)
-            indices = apply_nms_opencv(boxes_xyxy, max_scores, self.conf_thresh, self.nms_thresh)
-
-            if len(indices) == 0:
-                return sv.Detections.empty()
-
-            return sv.Detections(
-                xyxy=boxes_xyxy[indices],
-                confidence=max_scores[indices],
-                class_id=class_ids[indices].astype(int)
-            )
-
-        except Exception as e:
-            logger.error(f"YOLOX postprocessing failed: {e}")
-            raise PostprocessError(
-                "YOLOX postprocessing failed",
-                context={"output_shape": outputs.shape if outputs.ndim else "?", "error": str(e)}
-            ) from e
+    # ── Inference ─────────────────────────────────────────────────────────────
 
     def predict(self, frame: np.ndarray) -> sv.Detections:
         """
-        Run inference on a single frame.
+        Run YOLOX inference on a single BGR frame.
 
         Args:
-            frame: Input BGR image
+            frame: BGR uint8 image (any resolution).
 
         Returns:
-            sv.Detections with detected objects
+            sv.Detections in original-image pixel coordinates.
 
         Raises:
-            InferenceError: If inference fails
+            InferenceError: If inference fails.
         """
         try:
             blob, ratio = self.preprocess(frame)
+            raw_outputs = self.session.run(None, {self.input_name: blob})
 
-            # Inference
-            outputs = self.session.run(None, {self.input_name: blob})
+            predictions = self._decode_outputs(raw_outputs[0])  # (N, 5+C)
 
-            detections = self.postprocess(outputs[0], ratio)
-            logger.debug(f"YOLOX inference: {len(detections)} detections")
-            return detections
+            boxes      = predictions[:, :4]          # cx, cy, w, h (canvas pixels)
+            obj_conf   = predictions[:, 4:5]         # objectness
+            cls_scores = predictions[:, 5:]          # per-class probabilities
+            scores     = obj_conf * cls_scores       # combined score
 
+            # Convert cxcywh → xyxy (still on letterbox canvas)
+            boxes_xyxy = np.stack([
+                boxes[:, 0] - boxes[:, 2] / 2,
+                boxes[:, 1] - boxes[:, 3] / 2,
+                boxes[:, 0] + boxes[:, 2] / 2,
+                boxes[:, 1] + boxes[:, 3] / 2,
+            ], axis=1)
+
+            # Undo letterbox scaling → original image pixels
+            boxes_xyxy /= ratio
+
+            dets = _multiclass_nms_class_agnostic(
+                boxes_xyxy, scores,
+                nms_thresh=self.nms_thresh,
+                score_thresh=self.conf_thresh,
+            )
+
+            if dets is None:
+                return sv.Detections.empty()
+
+            logger.debug(f"YOLOX | detections={len(dets)} | conf>{self.conf_thresh}")
+
+            return sv.Detections(
+                xyxy=dets[:, :4].astype(np.float32),
+                confidence=dets[:, 4].astype(np.float32),
+                class_id=dets[:, 5].astype(int),
+            )
+
+        except (PreprocessError, PostprocessError, InferenceError):
+            raise
         except Exception as e:
-            logger.error(f"YOLOX inference failed: {e}")
             raise InferenceError(
                 "YOLOX inference failed",
-                context={"image_shape": frame.shape, "error": str(e)}
+                context={"frame_shape": list(frame.shape), "error": str(e)},
             ) from e

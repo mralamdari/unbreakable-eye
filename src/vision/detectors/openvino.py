@@ -1,6 +1,12 @@
 """
 OpenVINO detector using Intel OpenVINO Runtime.
-Best for: Intel hardware, edge inference optimization.
+
+Tested with: person-detection-retail-0013 (SSD-based, output shape [1,1,N,7])
+Output format per detection: [image_id, label, conf, x_min, y_min, x_max, y_max]
+  where coordinates are NORMALIZED [0,1] relative to the MODEL INPUT size.
+
+Preprocessing: plain BGR resize (no letterbox, no normalization) — this model
+was trained on raw BGR 0-255 values at a fixed 320×544 resolution.
 """
 
 import cv2
@@ -10,241 +16,196 @@ from loguru import logger
 from typing import Tuple
 
 from src.vision.base import BaseDetector
-from src.vision.utils import letterbox, normalize_imagenet, cxcywh_to_xyxy, scale_boxes
 from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError, PostprocessError
 
 try:
-    from openvino.runtime import Core
+    import openvino as ov
 except ImportError:
-    raise ImportError("openvino not installed. Install with: pip install openvino")
+    raise ImportError(
+        "openvino not installed. Run: pip install openvino"
+    )
 
 
 class OpenVinoDetector(BaseDetector):
-    """
-    OpenVINO detector with native OpenVINO Runtime.
-    Optimized for Intel hardware acceleration.
-    """
+    """SSD-style object detector via Intel OpenVINO Runtime."""
 
     def __init__(
         self,
         model_path: str,
         conf_thresh: float = 0.45,
-        device: str = "CPU"
+        device: str = "CPU",
     ):
         """
         Args:
-            model_path: Path to .onnx or .xml model file
-            conf_thresh: Confidence threshold
-            device: OpenVINO device ("CPU", "GPU", "HETERO:GPU,CPU", etc.)
+            model_path:  Path to .xml model file (companion .bin must be alongside it).
+            conf_thresh: Minimum confidence to keep a detection.
+            device:      OpenVINO device string: "CPU", "GPU", "AUTO", etc.
 
         Raises:
-            ModelLoadError: If model cannot be loaded
+            ModelLoadError: If the model cannot be loaded or compiled.
         """
         self.confidence_threshold = conf_thresh
-        self.device = device.upper()
+        self.device               = device.upper()
 
         try:
-            logger.info(f"Loading OpenVINO model from {model_path} on device {self.device}")
-            core = Core()
-            model = core.read_model(model=model_path)
-            self.model = core.compile_model(model=model, device_name=self.device)
+            logger.info(
+                f"Loading OpenVINO model | path={model_path} | device={self.device}"
+            )
+            core = ov.Core()
+            logger.debug(f"Available OpenVINO devices: {core.available_devices}")
 
-            # Create inference request
-            self.infer_request = self.model.create_infer_request()
-            self.input_layer = self.model.input(0)
-            self.output_layers = {output.get_any_name(): idx for idx, output in enumerate(self.model.outputs)}
+            model               = core.read_model(model_path)
+            self.compiled_model = core.compile_model(model=model, device_name=self.device)
+            self.input_layer    = self.compiled_model.input(0)
+            self.output_layer   = self.compiled_model.output(0)
 
-            # Get input shape
-            shape = self.input_layer.shape
-            self.input_h = shape[2] if len(shape) > 2 and isinstance(shape[2], int) else 640
-            self.input_w = shape[3] if len(shape) > 3 and isinstance(shape[3], int) else 640
+            # Input layout is [B, C, H, W]
+            _, _, self.input_h, self.input_w = self.input_layer.shape
 
-            logger.info(f"OpenVINO model loaded: input {self.input_h}x{self.input_w}, "
-                       f"outputs: {len(self.output_layers)}")
+            logger.info(
+                f"OpenVINO ready | input={self.input_h}x{self.input_w} "
+                f"| output_shape={list(self.output_layer.shape)}"
+            )
 
+        except ModelLoadError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to load OpenVINO model: {e}")
             raise ModelLoadError(
                 "Failed to load OpenVINO model",
-                context={"model_path": model_path, "device": device, "error": str(e)}
+                context={"model_path": model_path, "device": device, "error": str(e)},
             ) from e
 
-    def preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
+    # ── Preprocessing ─────────────────────────────────────────────────────────
+
+    def preprocess(self, img: np.ndarray) -> np.ndarray:
         """
-        Preprocess frame for OpenVINO inference.
+        Resize frame to model input size and convert to NCHW float32.
+
+        This model (person-detection-retail-0013) expects:
+          - BGR channel order (OpenCV default — no conversion needed)
+          - Raw 0-255 pixel values (no /255, no mean/std)
+          - Shape (1, 3, input_h, input_w)
 
         Args:
-            img: Input BGR image
+            img: BGR uint8 frame (any resolution).
 
         Returns:
-            (input_blob, ratio) where input_blob is (1, 3, H, W) and
-            ratio is the scale factor for box rescaling
+            (1, 3, input_h, input_w) float32 contiguous array.
 
         Raises:
-            PreprocessError: If preprocessing fails
+            PreprocessError: If resizing fails.
         """
         try:
-            # Letterbox with aspect ratio preservation
-            img_padded, _ = letterbox(img, self.input_h, self.input_w, pad_value=0)
-
-            # ImageNet normalization (standard for OpenVINO models)
-            img_norm = normalize_imagenet(img_padded)
-
-            # HWC → CHW
-            img_chw = np.transpose(img_norm, (2, 0, 1))
-
-            # Add batch dimension
-            blob = np.expand_dims(img_chw, axis=0).astype(np.float32)
-
-            # Calculate ratio for rescaling boxes
-            h, w = img.shape[:2]
-            scale = min(self.input_h / h, self.input_w / w)
-            ratio = 1.0 / scale
-
-            return np.ascontiguousarray(blob), ratio
+            resized = cv2.resize(img, (self.input_w, self.input_h),
+                                 interpolation=cv2.INTER_LINEAR)
+            blob = resized.transpose(2, 0, 1)               # HWC → CHW
+            blob = np.expand_dims(blob, axis=0).astype(np.float32)
+            return np.ascontiguousarray(blob)
 
         except Exception as e:
-            logger.error(f"OpenVINO preprocessing failed: {e}")
             raise PreprocessError(
                 "OpenVINO preprocessing failed",
-                context={"image_shape": img.shape, "error": str(e)}
+                context={"image_shape": list(img.shape), "error": str(e)},
             ) from e
+
+    # ── Postprocessing ────────────────────────────────────────────────────────
 
     def postprocess(
         self,
-        outputs_dict: dict,
-        ratio: float,
-        img_h: int,
-        img_w: int
+        result: np.ndarray,
+        orig_h: int,
+        orig_w: int,
     ) -> sv.Detections:
         """
-        Decode OpenVINO model outputs.
+        Decode SSD-style output into sv.Detections.
+
+        person-detection-retail-0013 output shape: [1, 1, N, 7]
+        Each row: [image_id, label, conf, x_min, y_min, x_max, y_max]
+          where x/y values are normalized [0,1] relative to model input size.
 
         Args:
-            outputs_dict: Dict of {output_name: array} from inference
-            ratio: Scale ratio from preprocessing
-            img_h: Original image height
-            img_w: Original image width
+            result: Raw output tensor from compiled_model inference.
+            orig_h: Height of the original (pre-resize) frame.
+            orig_w: Width  of the original (pre-resize) frame.
 
         Returns:
-            sv.Detections with detected objects
+            sv.Detections in original-image pixel coordinates.
 
         Raises:
-            PostprocessError: If postprocessing fails
+            PostprocessError: If decoding fails.
         """
         try:
-            # Extract outputs by searching for shape patterns
-            # Typically: boxes are (N, 4) and scores are (N, num_classes) or (N,)
-            boxes = None
-            scores = None
+            # Flatten to (N, 7) regardless of leading batch/channel dims
+            detections_raw = np.asarray(result).reshape(-1, 7)
 
-            for name, tensor in outputs_dict.items():
-                data = tensor.data
-                if data.ndim == 2:
-                    if data.shape[1] == 4:
-                        boxes = data
-                    elif data.shape[1] > 1:
-                        scores = data
-                    elif data.shape[1] == 1:
-                        if scores is None:
-                            scores = data
-                elif data.ndim == 1:
-                    if scores is None:
-                        scores = data
+            boxes, scores, class_ids = [], [], []
+            for det in detections_raw:
+                _, label, conf, x_min, y_min, x_max, y_max = det
 
-            if boxes is None or scores is None:
-                logger.warning("Could not identify boxes or scores in output")
-                return sv.Detections.empty()
+                if conf < self.confidence_threshold:
+                    continue
 
-            # Ensure 2D shapes
-            if scores.ndim == 1:
-                scores = scores[:, np.newaxis]
+                # Scale normalized coords to original image pixels
+                x1 = max(0,      int(x_min * orig_w))
+                y1 = max(0,      int(y_min * orig_h))
+                x2 = min(orig_w, int(x_max * orig_w))
+                y2 = min(orig_h, int(y_max * orig_h))
 
-            # Get max score and class
-            if scores.shape[1] > 1:
-                class_ids = np.argmax(scores, axis=1)
-                max_scores = np.max(scores, axis=1)
-            else:
-                class_ids = np.zeros(scores.shape[0], dtype=int)
-                max_scores = scores.squeeze()
+                if x2 <= x1 or y2 <= y1:
+                    continue   # degenerate box — skip
 
-            # Filter by confidence
-            mask = max_scores > self.confidence_threshold
-            if not np.any(mask):
-                return sv.Detections.empty()
+                boxes.append([x1, y1, x2, y2])
+                scores.append(float(conf))
+                class_ids.append(int(label))
 
-            boxes = boxes[mask]
-            max_scores = max_scores[mask]
-            class_ids = class_ids[mask]
-
-            # Boxes format detection and conversion
-            # Assume normalized [0, 1] CXCYWH format (common in OpenVINO exports)
-            boxes_abs = boxes.copy()
-            if np.max(boxes) <= 1.0:  # Normalized format
-                boxes_abs[:, 0] *= self.input_w
-                boxes_abs[:, 1] *= self.input_h
-                boxes_abs[:, 2] *= self.input_w
-                boxes_abs[:, 3] *= self.input_h
-
-            # CXCYWH → XYXY
-            boxes_xyxy = cxcywh_to_xyxy(boxes_abs)
-
-            # Rescale to original image coordinates
-            boxes_xyxy = scale_boxes(
-                boxes_xyxy, ratio, ratio,
-                clip_h=img_h,
-                clip_w=img_w
-            )
-
+            # supervision requires correctly shaped arrays even when empty
             return sv.Detections(
-                xyxy=boxes_xyxy,
-                confidence=max_scores,
-                class_id=class_ids.astype(int)
+                xyxy=np.array(boxes,     dtype=np.float32).reshape(-1, 4),
+                confidence=np.array(scores,    dtype=np.float32),
+                class_id=np.array(class_ids, dtype=int),
             )
 
         except Exception as e:
-            logger.error(f"OpenVINO postprocessing failed: {e}")
             raise PostprocessError(
                 "OpenVINO postprocessing failed",
-                context={"outputs_keys": list(outputs_dict.keys()), "error": str(e)}
+                context={"result_shape": list(np.asarray(result).shape), "error": str(e)},
             ) from e
+
+    # ── Inference ─────────────────────────────────────────────────────────────
 
     def predict(self, frame: np.ndarray) -> sv.Detections:
         """
-        Run inference on a single frame.
+        Run OpenVINO inference on a single BGR frame.
 
         Args:
-            frame: Input BGR image
+            frame: BGR uint8 image (any resolution).
 
         Returns:
-            sv.Detections with detected objects
+            sv.Detections in original-image pixel coordinates.
 
         Raises:
-            InferenceError: If inference fails
+            InferenceError: If inference fails.
         """
         try:
-            img_h, img_w = frame.shape[:2]
-            pre_frame, ratio = self.preprocess(frame)
+            orig_h, orig_w = frame.shape[:2]
+            blob           = self.preprocess(frame)
+            result         = self.compiled_model([blob])[self.output_layer]
+            detections     = self.postprocess(result, orig_h, orig_w)
 
-            # Set input tensor
-            self.infer_request.set_input_tensor(pre_frame)
-
-            # Run inference
-            self.infer_request.infer()
-
-            # Extract outputs as dict
-            outputs_dict = {}
-            for output in self.model.outputs:
-                name = output.get_any_name()
-                outputs_dict[name] = self.infer_request.get_output_tensor(output)
-
-            detections = self.postprocess(outputs_dict, ratio, img_h, img_w)
-            logger.debug(f"OpenVINO inference: {len(detections)} detections")
+            logger.debug(
+                f"OpenVINO | detections={len(detections)} "
+                f"| conf>{self.confidence_threshold}"
+            )
             return detections
 
+        except (PreprocessError, PostprocessError):
+            raise
         except Exception as e:
-            logger.error(f"OpenVINO inference failed: {e}")
             raise InferenceError(
                 "OpenVINO inference failed",
-                context={"image_shape": frame.shape, "device": self.device, "error": str(e)}
+                context={
+                    "frame_shape": list(frame.shape),
+                    "device": self.device,
+                    "error": str(e),
+                },
             ) from e

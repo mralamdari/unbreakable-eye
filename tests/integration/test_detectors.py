@@ -441,6 +441,7 @@ if __name__ == "__main__":
     parser.add_argument("--model",  required=True,       help="Path to .onnx file")
     parser.add_argument("--image",  required=True,       help="Path to input image")
 
-# run('models/onnx-community/dfine_n_coco-ONNX/onnx/model_quantized.onnx', 'data/test.png', 0.5, 'data/output.png')
+run('models/onnx-community/dfine_s_coco-ONNX/onnx/model.onnx', 'data/test.png', 0.4, 'data/output.png')
+
 # run('models/onnx-community/rfdetr_small-ONNX/onnx/model_quantized.onnx', 'data/test.png', 0.5, 'data/output.png')
-run('models/onnx-community/rfdetr_small-ONNX/onnx/model_quantized.onnx', 'data/test.png', 0.2, 'data/output.png')
+# run('models/onnx-community/rfdetr_small-ONNX/onnx/model_quantized.onnx', 'data/test.png', 0.2, 'data/output.png')

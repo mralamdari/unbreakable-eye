@@ -245,12 +245,15 @@ def _download_yolox_github(url: str, destination: str, timeout: int = 60) -> str
             resp.raise_for_status()
             total = int(resp.headers.get("content-length", 0))
             done  = 0
+            counter = 0
             with open(tmp, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=65_536):
                     if chunk:
                         fh.write(chunk)
                         done += len(chunk)
-                        if total:
+                        counter += 1
+                        if total and counter%50==0:
+                            counter = 0
                             logger.debug(
                                 f"YOLOX download: {done/1024/1024:.1f} MB "
                                 f"/ {total/1024/1024:.1f} MB"

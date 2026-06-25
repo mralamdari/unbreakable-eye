@@ -1,0 +1,21 @@
+# docker-compose.gpu.yml
+# Overlay for NVIDIA GPU support.
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#
+# Requires: nvidia-container-toolkit installed on the host
+# Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - DEVICE=cuda

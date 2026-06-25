@@ -1,211 +1,163 @@
 """
-RF-DETR / D-FINE detector using ONNX Runtime.
+HF Transformer object detector using ONNX Runtime.
 
-──────────────────────────────────────────────────────────────────────────
-These two model families share the same DETR architecture and sigmoid
-scoring but differ in THREE ways that ALL must be correct simultaneously:
-──────────────────────────────────────────────────────────────────────────
+Model family: onnx-community/*-ONNX  (Transformers.js / Optimum export)
+Best for: High-accuracy indoor/retail object detection on CPU.
 
-  RF-DETR  (onnx-community/rfdetr_*-ONNX, exported by Roboflow):
-    Preprocessing : BGR→RGB → resize to input_h×input_w → /255 →
-                   SUBTRACT ImageNet mean, DIVIDE ImageNet std → NCHW
-                   (do_normalize=true)
-    Box format    : already XYXY, normalized [0,1] relative to ORIGINAL
-                   image. Roboflow bakes cxcywh→xyxy INSIDE the graph.
-    Decode        : boxes * [img_w, img_h, img_w, img_h] → pixel coords.
+Preprocessing facts (from preprocessor_config.json — ustc-community/*-coco):
+  - Resize:     640×640, BILINEAR, plain square resize (no letterbox)
+  - Rescale:    pixel / 255.0  ONLY
+  - Normalize:  NONE — do_normalize=false in RTDetrImageProcessor config
+                The image_mean/std fields are present but never applied.
+                Applying ImageNet norm shifts every pixel ~0.45 outside
+                the training distribution → near-zero detections.
+  - Layout:     RGB, NCHW, float32
 
-  D-FINE   (onnx-community/dfine_*-ONNX, exported by Transformers.js):
-    Preprocessing : BGR→RGB → resize to 640×640 → /255 ONLY — NO
-                   mean/std subtraction (do_normalize=false confirmed in
-                   ustc-community/dfine-*-coco preprocessor_config.json).
-                   Applying ImageNet norm here shifts every pixel ~0.45
-                   outside the training distribution → near-zero detections.
-    Box format    : CXCYWH, normalized [0,1] relative to input canvas.
-                   post_process_object_detection runs OUTSIDE the graph.
-    Decode        : cxcywh→xyxy (normalized) →
-                   x cols * img_w, y cols * img_h → pixel coords.
-
-Family is auto-detected from output tensor names:
-  "pred_boxes" in name → D-FINE  (cxcywh_input_normalized)
-  "dets" / bare "boxes" → RF-DETR (xyxy_original_normalized)
+Output format (native HF export — NOT Roboflow convention):
+  - pred_boxes: (1, N, 4) — cx,cy,w,h normalized [0,1] relative to input canvas
+  - logits:     (1, N, num_classes) — raw class logits, decoded with sigmoid
 """
 
 import os
-import cv2
 import numpy as np
+import cv2
 import supervision as sv
 from loguru import logger
-from typing import Tuple
-
+from typing import List, Tuple
+from src.core.config import settings
 from src.vision.base import BaseDetector
-from src.vision.utils import create_session, bgr_to_rgb, normalize_imagenet, cxcywh_to_xyxy
+from src.vision.utils import create_session, bgr_to_rgb
 from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError, PostprocessError
 
-_RFDETR_DEFAULT_SIZE = 560   # 560 / 14 = 40 — valid DINOv2 patch-divisible size
-_DFINE_DEFAULT_SIZE  = 640   # D-FINE fixed training/export resolution
-
-
 class HFTransformerDetector(BaseDetector):
-    """RF-DETR / D-FINE detector via ONNX Runtime.
+    """
+    Transformer detector using ONNX Runtime backend.
 
-    Auto-detects which family a given .onnx file belongs to from output
-    tensor names, then applies the correct preprocessing AND postprocessing
-    for that family. Using the wrong preprocessing OR the wrong decode is
-    individually enough to produce garbage — both must match simultaneously.
+    Accepts any onnx-community/*-ONNX model file directly —
+    no torch or transformers dependency at inference time.
     """
 
     def __init__(
         self,
         model_path: str,
-        conf_thresh: float = 0.45,
+        conf_thresh: float = 0.4,
         device: str = "cpu",
     ):
-        self.confidence_threshold = conf_thresh
+        """
+        Args:
+            model_path:  Path to the .onnx file.
+            conf_thresh: Confidence threshold (0.3–0.5 recommended).
+            device:      Device hint ("cpu" / "cuda") — informational only,
+                         actual provider selection is handled by create_session.
+
+        Raises:
+            ModelLoadError: If the ONNX session cannot be created or the
+                             graph shape/output count is unexpected.
+        """
+        self.confidence_thres = conf_thresh
+        self.device = device.lower()
 
         try:
             num_threads = max(1, (os.cpu_count() or 4) // 2 - 1)
             logger.info(
-                f"Loading HF-transformer ONNX | path={model_path} | threads={num_threads}"
+                f"Loading Transformer ONNX | path={model_path} | threads={num_threads}"
             )
             self.session    = create_session(model_path, num_threads=num_threads)
             self.input_name = self.session.get_inputs()[0].name
 
             if len(self.session.get_outputs()) != 2:
                 raise ModelLoadError(
-                    "Expected exactly 2 ONNX outputs (boxes + class scores)",
+                    "Transformer ONNX: expected exactly 2 outputs (pred_boxes + logits)",
                     context={
                         "model_path": model_path,
-                        "outputs": [o.name for o in self.session.get_outputs()],
+                        "outputs":    [o.name for o in self.session.get_outputs()],
                     },
                 )
 
-            # ── Family detection via output tensor names ──────────────────
-            # "pred_boxes" is the native HF/Transformers.js export name for
-            # D-FINE; "dets"/"boxes" is Roboflow's RF-DETR export name.
-            # These are the actual, distinct conventions each exporter uses —
-            # not guesses.
-            boxes_name = None
-            for out in self.session.get_outputs():
-                name = out.name.lower()
-                if "box" in name or "det" in name:
-                    boxes_name = name
-                    break
+            # Read input (H, W) from the ONNX graph — never hardcode.
+            # onnxruntime reports dynamic/symbolic dims as strings (e.g.
+            # "height") rather than ints — detect and fall back safely.
+            self.input_h, self.input_w = settings.HF_INPUT_SIZE, settings.HF_INPUT_SIZE
 
-            if boxes_name and "pred_box" in boxes_name:
-                self.box_format  = "cxcywh_input_normalized"   # D-FINE
-                default_size     = _DFINE_DEFAULT_SIZE
-            else:
-                self.box_format  = "xyxy_original_normalized"  # RF-DETR
-                default_size     = _RFDETR_DEFAULT_SIZE
-
-            # ── Input size — read from graph, never hardcode ──────────────
-            shape = self.session.get_inputs()[0].shape   # [1, 3, H, W]
-            self.input_h, self.input_w = self._resolve_input_size(shape, default_size)
-
-            output_names = [o.name for o in self.session.get_outputs()]
             logger.info(
-                f"HF-transformer ready | family={self.box_format} "
-                f"| input={self.input_h}×{self.input_w} "
-                f"| outputs={output_names} | conf={conf_thresh}"
+                f"Transformer ready | input={self.input_h}×{self.input_w} "
+                f"| outputs={[o.name for o in self.session.get_outputs()]} "
+                f"| conf_thresh={conf_thresh}"
             )
 
         except ModelLoadError:
             raise
         except Exception as e:
+            logger.error(f"Failed to initialise Transformer ONNX detector: {e}")
             raise ModelLoadError(
-                "Failed to initialise HF-transformer ONNX detector",
+                "Failed to initialise Transformer ONNX detector",
                 context={"model_path": model_path, "error": str(e)},
             ) from e
 
-    # ── Input-size resolution ─────────────────────────────────────────────
-
-    def _resolve_input_size(self, shape: list, default_size: int) -> Tuple[int, int]:
-        """
-        Read (H, W) from the ONNX graph's declared input shape [1, 3, H, W].
-
-        onnxruntime reports dynamic/symbolic dims as strings (e.g. "height")
-        rather than ints — this detects that and falls back to the
-        family-appropriate default instead of crashing or silently producing 0.
-        """
-        if len(shape) != 4:
-            raise ModelLoadError(
-                "Unexpected input rank", context={"shape": shape, "expected_rank": 4}
-            )
-        raw_h, raw_w = shape[2], shape[3]
-        h = raw_h if isinstance(raw_h, int) and raw_h > 0 else None
-        w = raw_w if isinstance(raw_w, int) and raw_w > 0 else None
-
-        if h is None or w is None:
-            logger.warning(
-                f"ONNX graph has dynamic/symbolic input dims (H={raw_h}, W={raw_w}). "
-                f"Falling back to {default_size}×{default_size} "
-                f"for family={self.box_format}. Re-export with a fixed shape to avoid this."
-            )
-            h = h or default_size
-            w = w or default_size
-
-        return h, w
-
     # ── Preprocessing ─────────────────────────────────────────────────────
 
-    def preprocess(self, frame: np.ndarray) -> np.ndarray:
+    def preprocess(self, image: np.ndarray) -> np.ndarray:
         """
-        BGR frame → (1, 3, H, W) float32 blob.
+        Prepare a BGR frame for Transformer ONNX inference.
 
-        Shared: BGR→RGB, plain square resize (no letterbox), NCHW layout.
-        Differs per family in the normalization step only:
+        Pipeline (matches AutoImageProcessor("ustc-community/*") exactly,
+        confirmed from preprocessor_config.json):
+          BGR → RGB → plain square resize (no letterbox) →
+          /255.0 ONLY (do_normalize=false) → NCHW float32
 
-          RF-DETR → /255 then ImageNet mean/std  (do_normalize=true)
-          D-FINE  → /255 ONLY                    (do_normalize=false)
+        Args:
+            image: BGR uint8 image, any resolution.
+
+        Returns:
+            (1, 3, input_h, input_w) float32 contiguous array.
 
         Raises:
-            PreprocessError
+            PreprocessError: If any step fails.
         """
         try:
-            img = bgr_to_rgb(frame)
+            img = bgr_to_rgb(image)
+
+            # Plain square resize — no letterbox (Transformer was trained this way).
             img = cv2.resize(
                 img, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR
             )
 
-            if self.box_format == "cxcywh_input_normalized":
-                # D-FINE: rescale by 1/255 ONLY.
-                # Confirmed from preprocessor_config.json:
-                #   "do_normalize": false, "rescale_factor": 0.00392156862745098
-                img = img.astype(np.float32) / 255.0
-            else:
-                # RF-DETR: /255 + ImageNet mean/std subtraction.
-                img = normalize_imagenet(img)
+            # Rescale by 1/255 ONLY — do_normalize=false means NO mean/std.
+            img = img.astype(np.float32) / 255.0
 
+            # HWC → NCHW, add batch dim
             img = np.transpose(img, (2, 0, 1))[np.newaxis]
             return np.ascontiguousarray(img, dtype=np.float32)
 
         except Exception as e:
+            logger.error(f"Transformer preprocessing failed: {e}")
             raise PreprocessError(
-                "HF-transformer preprocessing failed",
-                context={"frame_shape": frame.shape, "error": str(e)},
+                "Transformer preprocessing failed",
+                context={"image_shape": image.shape, "error": str(e)},
             ) from e
 
     # ── Output routing ────────────────────────────────────────────────────
 
     def _split_outputs(self, outputs: list) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Identify (boxes, logits) from session.run() output list and strip
-        the batch dimension.
+        Identify (boxes, logits) tensors and strip the batch dimension.
 
-        Uses shape-based detection on still-batched tensors — the only
-        unambiguous signal regardless of export naming conventions:
-            out.shape[-1] == 4  →  boxes tensor
-        Returns (boxes, logits) both with batch dim removed → (N,4), (N,C).
+        Uses shape-based detection on still-batched tensors — unambiguous
+        regardless of export naming conventions:
+            out.shape[-1] == 4  →  boxes tensor  (pred_boxes)
+            otherwise           →  logits tensor
+
+        Args:
+            outputs: Raw list from session.run(),
+                     shapes (1, N, 4) and (1, N, num_classes).
+
+        Returns:
+            boxes:  (N, 4)  cxcywh normalized [0,1], batch dim removed.
+            logits: (N, C)  raw class logits,         batch dim removed.
 
         Raises:
-            InferenceError: If output count ≠ 2 or no tensor has last-dim 4.
+            InferenceError: If neither tensor has last-dim == 4.
         """
-        if len(outputs) != 2:
-            raise InferenceError(
-                f"Expected exactly 2 ONNX outputs, got {len(outputs)}",
-                context={"shapes": [list(o.shape) for o in outputs]},
-            )
-
         out0, out1 = outputs[0], outputs[1]
 
         if out0.shape[-1] == 4:
@@ -232,45 +184,36 @@ class HFTransformerDetector(BaseDetector):
         original_shape: Tuple[int, int],
     ) -> sv.Detections:
         """
-        Decode raw ONNX outputs into sv.Detections in original-image pixels.
+        Decode raw Transformer ONNX outputs into sv.Detections.
 
-        Both families:
-          1. sigmoid on logits → probs                    (always unconditional)
-          2. argmax per query  → class_id + confidence
-          3. confidence filter → self.confidence_threshold
+        Steps:
+          1. sigmoid on logits → per-class probabilities
+          2. argmax per query  → class_id + confidence score
+          3. confidence filter → self.confidence_thres
+          4. cxcywh → xyxy:  x cols × orig_w,  y cols × orig_h  → pixels
+          5. clip to original image boundaries
 
-        Then diverge:
-          D-FINE  (cxcywh_input_normalized):
-            4. cxcywh → xyxy  (still normalized [0,1])
-            5. x cols × img_w,  y cols × img_h  → pixels
+        Args:
+            boxes:          (N, 4) cxcywh normalized [0,1], batch dim removed.
+            logits:         (N, num_classes) raw logits, batch dim removed.
+            original_shape: (H, W) of the frame passed to predict().
 
-          RF-DETR (xyxy_original_normalized):
-            4. boxes already xyxy, normalized to original image
-            5. × [img_w, img_h, img_w, img_h]  → pixels
-
-        NOTE: sigmoid is applied UNCONDITIONALLY — not gated on
-        `np.min(logits) < 0`. If all logits happen to be positive (e.g.
-        very confident frame), the gated version skips sigmoid entirely
-        and compares raw logits against a 0-1 threshold, which either
-        passes everything or nothing. Always sigmoid.
+        Returns:
+            sv.Detections in original-image pixel coordinates.
 
         Raises:
-            PostprocessError
+            PostprocessError: If any decode step fails.
         """
         try:
             img_h, img_w = original_shape
 
-            # Step 1-2: sigmoid → best class per query
-            probs     = 1.0 / (1.0 + np.exp(-logits))          # (N, C)
-            class_ids = np.argmax(probs, axis=1)                 # (N,)
-            scores    = probs[np.arange(len(class_ids)), class_ids]  # (N,)
+            # Step 1-2: sigmoid (unconditional — never gate on np.min) → argmax
+            probs     = 1.0 / (1.0 + np.exp(-logits))              # (N, C)
+            class_ids = np.argmax(probs, axis=1)                    # (N,)
+            scores    = probs[np.arange(len(class_ids)), class_ids] # (N,)
 
             # Step 3: confidence filter
-            # CRITICAL: use self.confidence_threshold, NOT a bare `conf_thresh`
-            # variable. A bare name resolves from the enclosing scope at runtime
-            # and silently produces threshold=0, passing all 300 queries through
-            # and returning random garbage class IDs as detections.
-            keep = scores > self.confidence_threshold
+            keep = scores > self.confidence_thres
             if not np.any(keep):
                 return sv.Detections.empty()
 
@@ -278,24 +221,22 @@ class HFTransformerDetector(BaseDetector):
             class_ids = class_ids[keep]
             boxes     = boxes[keep]
 
-            # Step 4-5: box decode, family-specific
-            if self.box_format == "cxcywh_input_normalized":
-                # D-FINE path: cxcywh → xyxy → scale x/y independently
-                cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-                x1 = (cx - w / 2) * img_w
-                y1 = (cy - h / 2) * img_h
-                x2 = (cx + w / 2) * img_w
-                y2 = (cy + h / 2) * img_h
-                boxes_px = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+            # Step 4: cxcywh → xyxy, scale x/y columns independently
+            cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+            x1 = (cx - w / 2) * img_w
+            y1 = (cy - h / 2) * img_h
+            x2 = (cx + w / 2) * img_w
+            y2 = (cy + h / 2) * img_h
+            boxes_px = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
 
-            else:
-                # RF-DETR path: already xyxy, normalized to original image
-                scale    = np.array([img_w, img_h, img_w, img_h], dtype=np.float32)
-                boxes_px = (boxes * scale).astype(np.float32)
-
-            # Clip to frame boundaries
+            # Step 5: clip to frame boundaries
             boxes_px[:, [0, 2]] = np.clip(boxes_px[:, [0, 2]], 0.0, img_w)
             boxes_px[:, [1, 3]] = np.clip(boxes_px[:, [1, 3]], 0.0, img_h)
+
+            logger.debug(
+                f"Transformer postprocess | kept={len(scores)} / total={len(probs)} "
+                f"| conf_thresh={self.confidence_thres}"
+            )
 
             return sv.Detections(
                 xyxy=boxes_px.reshape(-1, 4),
@@ -306,25 +247,25 @@ class HFTransformerDetector(BaseDetector):
         except PostprocessError:
             raise
         except Exception as e:
+            logger.error(f"Transformer postprocessing failed: {e}")
             raise PostprocessError(
-                "HF-transformer postprocessing failed",
+                "Transformer postprocessing failed",
                 context={
                     "boxes_shape":    list(boxes.shape),
                     "logits_shape":   list(logits.shape),
                     "original_shape": original_shape,
-                    "box_format":     self.box_format,
                     "error":          str(e),
                 },
             ) from e
 
     # ── Inference ─────────────────────────────────────────────────────────
 
-    def predict(self, frame: np.ndarray) -> sv.Detections:
+    def predict(self, image: np.ndarray) -> sv.Detections:
         """
-        Run inference on a single BGR frame.
+        Run Transformer inference on a single BGR frame.
 
         Args:
-            frame: BGR uint8 image, any resolution.
+            image: BGR uint8 image, any resolution.
 
         Returns:
             sv.Detections in original-image pixel coordinates.
@@ -333,21 +274,83 @@ class HFTransformerDetector(BaseDetector):
             PreprocessError / InferenceError / PostprocessError
         """
         try:
-            tensor        = self.preprocess(frame)
-            outputs       = self.session.run(None, {self.input_name: tensor})
+            blob          = self.preprocess(image)
+            outputs       = self.session.run(None, {self.input_name: blob})
             boxes, logits = self._split_outputs(outputs)
-            detections    = self.postprocess(boxes, logits, frame.shape[:2])
+            detections    = self.postprocess(boxes, logits, image.shape[:2])
 
-            logger.debug(
-                f"{self.box_format} | detections={len(detections)} "
-                f"| conf>{self.confidence_threshold}"
-            )
+            logger.debug(f"Transformer predict | detections={len(detections)}")
             return detections
 
         except (PreprocessError, PostprocessError, InferenceError):
             raise
         except Exception as e:
+            logger.error(f"Transformer inference failed: {e}")
             raise InferenceError(
-                "HF-transformer inference failed",
-                context={"frame_shape": list(frame.shape), "error": str(e)},
+                "Transformer inference failed",
+                context={"image_shape": list(image.shape), "error": str(e)},
+            ) from e
+
+    def predict_batch(self, frames: List[np.ndarray]) -> List[sv.Detections]:
+        """
+        Run Transformer inference on a batch of BGR frames in a single forward pass.
+
+        Each frame is preprocessed independently (may differ in original
+        resolution), stacked into one batch tensor for a single session.run(),
+        then postprocessed back per-frame with its own original shape.
+
+        Args:
+            frames: List of BGR uint8 images, any resolution (may differ).
+
+        Returns:
+            List of sv.Detections, one per input frame, same order.
+
+        Raises:
+            PreprocessError / InferenceError / PostprocessError
+        """
+        if not frames:
+            return []
+
+        try:
+            blobs        = []
+            orig_shapes  = []
+
+            for frame in frames:
+                blobs.append(self.preprocess(frame))        # each (1,3,H,W)
+                orig_shapes.append(frame.shape[:2])
+
+            # Stack into batch (B, 3, H, W) — preprocess already adds batch dim,
+            # so concatenate on axis 0 rather than np.stack.
+            batch = np.concatenate(blobs, axis=0)
+
+            outputs_raw = self.session.run(None, {self.input_name: batch})
+
+            # outputs_raw[0]: (B, N, 4) boxes
+            # outputs_raw[1]: (B, N, C) logits
+            # _split_outputs works on a 2-element list with shape[-1]==4 detection,
+            # but returns only one frame's slice — handle batch manually here.
+            out0, out1 = outputs_raw[0], outputs_raw[1]
+            if out0.shape[-1] == 4:
+                all_boxes, all_logits = out0, out1
+            else:
+                all_logits, all_boxes = out0, out1
+
+            detections_list = [
+                self.postprocess(all_boxes[i], all_logits[i], orig_shapes[i])
+                for i in range(len(frames))
+            ]
+
+            total = sum(len(d) for d in detections_list)
+            logger.debug(
+                f"Transformer batch predict | frames={len(frames)} | total_detections={total}"
+            )
+            return detections_list
+
+        except (PreprocessError, PostprocessError, InferenceError):
+            raise
+        except Exception as e:
+            logger.error(f"Transformer batch inference failed: {e}")
+            raise InferenceError(
+                "Transformer batch inference failed",
+                context={"num_frames": len(frames), "error": str(e)},
             ) from e

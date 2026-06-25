@@ -1,5 +1,5 @@
 """
-Ultralytics YOLOv8 detector wrapper using native PyTorch implementation.
+Ultralytics YOLO detector wrapper using native PyTorch implementation.
 Best for: Real-time inference when GPU/CUDA is available.
 """
 
@@ -19,7 +19,7 @@ except ImportError:
 class UltralyticsDetector(BaseDetector):
     """
     YOLO detector using Ultralytics native implementation.
-    Supports YOLOv8, YOLOv10, and other ultralytics models.
+    Supports YOLO, YOLOv10, and other ultralytics models.
     """
 
     def __init__(self, model_path: str, conf_thresh: float = 0.45, device: str = "cuda"):
@@ -36,13 +36,13 @@ class UltralyticsDetector(BaseDetector):
         self.device = device.lower()
 
         try:
-            logger.info(f"Loading YOLOv8 model from {model_path} on {self.device}")
+            logger.info(f"Loading YOLO model from {model_path} on {self.device}")
             self.model = YOLO(model_path)
-            logger.info(f"YOLOv8 model loaded successfully")
+            logger.info(f"YOLO model loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load YOLOv8 model: {e}")
+            logger.error(f"Failed to load YOLO model: {e}")
             raise ModelLoadError(
-                f"Failed to load YOLOv8 model from {model_path}",
+                f"Failed to load YOLO model from {model_path}",
                 context={"path": model_path, "error": str(e)}
             ) from e
 
@@ -68,13 +68,13 @@ class UltralyticsDetector(BaseDetector):
             )[0]
             
             detections = sv.Detections.from_ultralytics(results)
-            logger.debug(f"YOLOv8 inference: {len(detections)} detections")
+            logger.debug(f"YOLO inference: {len(detections)} detections")
             return detections
 
         except Exception as e:
-            logger.error(f"YOLOv8 inference failed: {e}")
+            logger.error(f"YOLO inference failed: {e}")
             raise InferenceError(
-                f"YOLOv8 inference failed",
+                f"YOLO inference failed",
                 context={"frame_shape": frame.shape, "error": str(e)}
             ) from e
 
@@ -100,13 +100,13 @@ class UltralyticsDetector(BaseDetector):
             )
             
             detections_list = [sv.Detections.from_ultralytics(r) for r in results]
-            logger.debug(f"YOLOv8 batch inference: {len(frames)} frames, "
+            logger.debug(f"YOLO batch inference: {len(frames)} frames, "
                         f"{sum(len(d) for d in detections_list)} total detections")
             return detections_list
 
         except Exception as e:
-            logger.error(f"YOLOv8 batch inference failed: {e}")
+            logger.error(f"YOLO batch inference failed: {e}")
             raise InferenceError(
-                f"YOLOv8 batch inference failed",
+                f"YOLO batch inference failed",
                 context={"num_frames": len(frames), "error": str(e)}
             ) from e

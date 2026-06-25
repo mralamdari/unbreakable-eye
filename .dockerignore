@@ -1,7 +1,32 @@
-.ruff_cache/
-.mypy_cache/
-.hf_cache/
-__pycache__/
-env/
+# Virtual environment — never goes in the image
 venv/
 .venv/
+env/
+
+# Model weights — mounted as a volume at runtime
+models/
+
+# Data — mounted as a volume at runtime
+data/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Development artifacts
+.git/
+.github/
+logs/
+hf_cache/
+instance/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env

@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     def FRAME_BYTES(self) -> int:
         return self.WORKING_HEIGHT * self.WORKING_WIDTH * self.WORKING_CHANNELS
 
+    # --- Dataset ---
+    POSTGRES_HOST:     str = "localhost"
+    POSTGRES_PORT:     int = 5432
+    POSTGRES_DB:       str = "unbreakable_eye"
+    POSTGRES_USER:     str = "app"
+    POSTGRES_PASSWORD: str = ""
+    POSTGRES_POOL_MIN: int = 2
+    POSTGRES_POOL_MAX: int = 10
+
     # --- HARDWARE ---
     DEVICE: Device = Device.CPU
     HF_MODEL_FILENAME: str =  "onnx/model_quantized.onnx"
@@ -88,7 +97,7 @@ class Settings(BaseSettings):
     EMBEDDING_DIM: int = 512
     # KNN_N: int = 1000
     KNN_N: int = 200
-    
+    HF_INPUT_SIZE: int = 640
     # ALLOWED_ARCH = {"yolox", "ultralytics", "openvino", "onnx-community"}
     # This explicitly tells the system WHAT TYPE of model it is.
     # CRITICAL: This is used to route to the correct model handler and infer default filenames.

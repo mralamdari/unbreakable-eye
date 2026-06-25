@@ -61,8 +61,15 @@ def get_detector() -> BaseDetector:
         )
 
     elif arch in (ModelType.RFDETR, ModelType.DFINE):
+        _INPUT_DIM = (544, 544)
+        _MODEL_NAME = 'rfdetr'
+        if 'dfine' in model_path:
+            _MODEL_NAME = 'dfine'
+            _INPUT_DIM = (640, 640)
         return HFTransformerDetector(
             model_path=model_path,
+            model_name=_MODEL_NAME,
+            input_dim=_INPUT_DIM,
             conf_thresh=conf,
             device=device,
         )

@@ -73,7 +73,7 @@ _ARCH_NAME_TO_TYPE = {
     "rfdetr":     ModelType.RFDETR,
     "dfine":      ModelType.DFINE,
     "openvino":   ModelType.OPENVINO,
-    "ultralytics": ModelType.ULTRALYTICS,
+    "ultralytics":ModelType.ULTRALYTICS,
     "yolo_onnx":  ModelType.YOLO_ONNX,
 }
 
@@ -83,7 +83,7 @@ _ARCH_NAME_TO_ID = {
     "rfdetr":     'rfdetr_small-ONNX',
     "dfine":      'dfine_s_coco-ONNX',
     "openvino":   'FP16-INT8',
-    "ultralytics": 'yolo12s.pt',
+    "ultralytics":'yolo12s.pt',
     "yolo_onnx":  'yolo12s.onnx',
 }
 
@@ -124,6 +124,7 @@ model_paths = [
     'models/yolo_onnx/yolo12m.onnx',
     'models/yolo_onnx/yolo12l.onnx'
     ]
+
 
 # ── Data classes ──────────────────────────────────────────────────────────
 
@@ -202,25 +203,22 @@ def build_detector(arch_id: str):
     t1 = time.perf_counter()
     logger.info(f"[{arch_id}] model path resolved in {t1 - t0:.2f}s -> {model_path}")
     
-    
-    
-    
     if arch_id <= 6:
-        detector = HFTransformerDetector(model_path=model_path, conf_thresh=conf)
+        detector = HFTransformerDetector(model_path=model_path, conf_thresh=0.2)
     elif arch_id in [10, 11,12,13,14]:
         detector = YOLOXDetector(
             model_path=model_path,
-            conf_thresh=conf,
+            conf_thresh=0.4,
             nms_thresh=nms_thres,
             class_agnostic=settings.CLASS_AGNOSTIC,
         )
     elif arch_id == 7:
-        detector = OpenVinoDetector(model_path=model_path, conf_thresh=conf, device=device.upper())
+        detector = OpenVinoDetector(model_path=model_path, conf_thresh=0.98, device=device.upper())
     elif arch_id in [8, 9]:
-        detector = UltralyticsDetector(model_path=model_path, conf_thresh=conf, device=device)
+        detector = UltralyticsDetector(model_path=model_path, conf_thresh=0.4, device=device)
     elif arch_id >= 15:
         detector = UltralyticsONNXDetector(
-            model_path=model_path, conf_thresh=conf, iou_thres=iou_thres, device=device
+            model_path=model_path, conf_thresh=0.4, iou_thres=iou_thres, device=device
         )
     else:
         raise ValueError(f"No constructor wired for '{arch_id}'")
@@ -631,3 +629,51 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+==============================================================================
+Model        Load(s)   Mean(ms)   Median(ms)   P95(ms)   FPS     AvgDets   0-det frames 
+------------------------------------------------------------------------------
+dfine_n      0.34      110.81     107.27       133.36    9.02    13.49     0            
+dfine_m      0.74      328.07     324.01       365.66    3.05    71.06     0            
+dfine_s      0.45      202.34     197.86       230.37    4.94    80.64     0            
+rfdetr_medium 0.84      369.96     362.07       406.93    2.70    8.97      0            
+rfdetr_small 0.82      358.52     352.73       402.73    2.79    4.13      0            
+rfdetr_base  0.19      358.21     352.16       389.95    2.79    4.13      0            
+rfdetr_nano  0.78      342.79     337.94       379.19    2.92    1.33      76           
+openvino     4.12      10.01      9.54         13.09     99.86   5.42      0            
+yolo12s      0.99      165.50     157.42       213.30    6.04    4.01      5            
+yolo12n      0.34      75.03      70.50        99.01     13.33   3.29      1            
+yolox_l      4.31      1101.13    1067.70      1348.79   0.91    7.16      0            
+yolox_m      2.18      541.08     525.00       678.04    1.85    6.40      0            
+yolox_s      0.77      229.67     219.75       298.31    4.35    4.45      0            
+yolox_tiny   0.40      65.54      63.92        76.79     15.26   4.82      0            
+yolox_nano   0.13      32.31      31.19        39.16     30.95   4.67      1            
+yolo12m      1.88      399.41     385.52       499.02    2.50    4.03      0            
+yolo12l      2.47      533.11     519.48       652.28    1.88    4.06      0            
+==============================================================================

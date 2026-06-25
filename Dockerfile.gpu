@@ -1,0 +1,24 @@
+# infra/docker/Dockerfile.gpu
+# GPU-enabled image using NVIDIA CUDA base.
+# Uses onnxruntime-gpu instead of onnxruntime.
+
+FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-dev python3-pip \
+    libglib2.0-0 libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CPU requirements first, then override onnxruntime with GPU version
+COPY requirements.txt requirements-gpu.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir -r requirements-gpu.txt \
+ && pip uninstall -y onnxruntime || true
+
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+
+CMD ["uvicorn", "src.web.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

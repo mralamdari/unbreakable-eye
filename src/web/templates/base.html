@@ -9,7 +9,7 @@
 </head>
 <body>
     <header class="header">
-        <div class="brand">Shop Vision</div>
+        <a href="/" class="brand" style="color:inherit; text-decoration:none;">Shop Vision</a>
         <nav class="nav">
             <a href="/">Home</a>
             <a href="/about">About</a>
@@ -17,15 +17,14 @@
                 <a href="/register">Cameras</a>
                 <a href="/monitor">Monitor</a>
                 <a href="/analysis">Analysis</a>
-                <a href="/logout">Logout</a>
+                <a href="/logout">Log out</a>
             {% else %}
-                <a href="/register_user">Register</a>
-                <a href="/login">Login</a>
+                <a href="/register_user">Create account</a>
+                <a href="/login">Log in</a>
             {% endif %}
         </nav>
     </header>
 
-    <!-- Single flash message display (shown only if flash_message exists) -->
     {% if flash_message %}
     <div class="flash-bar flash-{{ flash_message.category }}">
         <span class="flash-text">{{ flash_message.message }}</span>

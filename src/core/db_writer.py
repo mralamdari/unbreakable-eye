@@ -94,6 +94,17 @@ def _dispatch(typ: str, cmd: tuple, response_queues: dict) -> None:
     elif typ == "store_embedding":
         _, customer_id, cam_id, emb, now, center_point, bbox_w, bbox_h = cmd
         with write_connection() as conn:
+            # Camera may have been deleted while its pipeline was still running
+            # (between DB delete and the next apply_changes() teardown cycle).
+            # Skip silently — the FK violation error is avoided and the pipeline
+            # will be stopped cleanly on the next /monitor visit.
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM cameras WHERE id = %s", (cam_id,))
+                if cur.fetchone() is None:
+                    logger.debug(
+                        f"store_embedding skipped — camera {cam_id} no longer in DB"
+                    )
+                    return
             store_embedding(
                 conn,
                 customer_id=customer_id,
@@ -125,6 +136,20 @@ def _dispatch(typ: str, cmd: tuple, response_queues: dict) -> None:
         )
 
         with write_connection() as conn:
+            # Same guard as store_embedding — camera may be gone between
+            # DB delete and pipeline teardown. Return a safe reply so the
+            # embedder worker doesn't block forever on response_queue.get().
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM cameras WHERE id = %s", (cam_id,))
+                if cur.fetchone() is None:
+                    logger.debug(
+                        f"match_or_register skipped — camera {cam_id} no longer in DB"
+                    )
+                    reply_queue = response_queues.get(cam_id)
+                    if reply_queue:
+                        reply_queue.put((request_id, None, False, None))
+                    return
+
             if matched_cust is not None:
                 customer_id = matched_cust
                 with conn.cursor() as cur:

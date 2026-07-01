@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     WORKING_HEIGHT: int = 512
     WORKING_WIDTH:  int = 512
     WORKING_CHANNELS: int = 3
+    DISPLAY_SHAPE: tuple = (1080, 1920, 3)          # H, W, C  — output SHM resolution
+    DISPLAY_BYTES: int   = 1920 * 1080 * 3          # = 6_220_800
     
     
     

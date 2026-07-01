@@ -1,10 +1,16 @@
 <!-- templates/login.html -->
 {% extends "base.html" %}
 {% block content %}
-<h2>Login</h2>
-<form method="post" class="form">
-  <label>Username <input type="text" name="username" required></label>
-  <label>Password <input type="password" name="password" required></label>
-  <button type="submit" class="button">Log in</button>
-</form>
+<div class="auth-page">
+  <div class="panel">
+    <h2>Welcome back</h2>
+    <p class="auth-sub">Log in to view your cameras and monitor your shop.</p>
+    <form method="post" class="form">
+      <label>Username <input type="text" name="username" autocomplete="username" required></label>
+      <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+      <button type="submit" class="button button-block">Log in</button>
+    </form>
+  </div>
+  <p class="auth-switch">No account yet? <a href="/register_user">Create one</a></p>
+</div>
 {% endblock %}

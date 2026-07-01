@@ -28,7 +28,7 @@ from src.core.config import settings, ModelType
 from src.core.exceptions import ModelConfigError, ModelDownloadError, ModelResolutionError
 
 # ── Environment ───────────────────────────────────────────────────────────────
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _YOLOX_GITHUB_BASE = (

@@ -1,12 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>Register cameras</h2>
+<h2>Manage Cameras</h2>
+
+{# ── Add camera form ──────────────────────────────────────────────────────── #}
 <form method="post" class="form">
   <label>Camera name <input type="text" name="name" placeholder="Entrance" required></label>
-  <label>Camera URL <input type="text" name="url" placeholder="rtsp://user:pass@ip:554/stream" required></label>
+  <label>Camera URL  <input type="text" name="url"  placeholder="rtsp://user:pass@ip:554/stream" required></label>
   <button type="submit" class="button">Add camera</button>
 </form>
 
+{# ── Registered cameras ───────────────────────────────────────────────────── #}
 <h3>Registered cameras</h3>
 <div class="cards">
   {% for cam in cameras %}
@@ -24,4 +27,5 @@
     <p>No cameras registered yet.</p>
   {% endfor %}
 </div>
+
 {% endblock %}

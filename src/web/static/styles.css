@@ -195,3 +195,86 @@ img, video {
 
 img { width:100%; height:100%; object-fit:cover; display:block; }
 @media (max-width:800px){ .features, .cards, .grid { grid-template-columns:1fr; } }
+
+
+/* ── Apply Changes bar (register.html) ──────────────────────────────────── */
+.apply-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 28px;
+  padding: 16px 20px;
+  background: #1a2030;
+  border: 1px solid #2a3a5a;
+  border-radius: 10px;
+}
+.apply-bar-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.apply-bar-hint {
+  color: var(--muted);
+  font-size: 0.88em;
+}
+.apply-btn {
+  white-space: nowrap;
+  background: #2a7aff;
+  font-weight: 600;
+  padding: 10px 20px;
+  flex-shrink: 0;
+}
+.apply-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── Startup banner (monitor.html) ──────────────────────────────────────── */
+.startup-banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 20px;
+  margin-bottom: 16px;
+  background: #181f2e;
+  border: 1px solid #2a3a5a;
+  border-radius: 10px;
+  color: var(--fg);
+}
+.startup-hint {
+  display: block;
+  color: var(--muted);
+  font-size: 0.88em;
+  margin-top: 2px;
+}
+.startup-spinner {
+  width: 22px;
+  height: 22px;
+  border: 3px solid #2a3a5a;
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Empty monitor state ─────────────────────────────────────────────────── */
+.empty-monitor {
+  text-align: center;
+  padding: 48px 16px;
+  color: var(--muted);
+}
+.empty-monitor p { margin-bottom: 16px; font-size: 1.1em; }
+
+/* ── Monitor hint line ───────────────────────────────────────────────────── */
+.monitor-hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+@media (max-width: 600px) {
+  .apply-bar { flex-direction: column; align-items: flex-start; }
+  .startup-banner { flex-wrap: wrap; }
+}

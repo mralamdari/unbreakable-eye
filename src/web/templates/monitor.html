@@ -1,8 +1,29 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>Monitor cameras</h2>
-<p>Click a tile to zoom; layout adapts to fill the screen.</p>
 
+{# ── Startup/restart banner — shown while pipelines are booting ──────────── #}
+{# pipelines_running=False when cameras_dirty triggered a restart, or on      #}
+{# first visit after login before apply_changes() Phase C has finished.       #}
+{% if not pipelines_running %}
+<div class="startup-banner" id="startup-banner">
+  <div class="startup-spinner"></div>
+  <div>
+    <strong>Pipelines starting…</strong>
+    <span class="startup-hint">
+      YOLO and camera workers are loading. This page will refresh automatically.
+    </span>
+  </div>
+  <a href="/monitor" class="button outline" style="white-space:nowrap;">Refresh now</a>
+</div>
+<script>
+  // Auto-refresh every 3 s until pipelines_running=True.
+  setTimeout(() => window.location.reload(), 3000);
+</script>
+{% endif %}
+
+{# ── Camera grid ──────────────────────────────────────────────────────────── #}
+{% if cameras %}
+<p class="monitor-hint">Click a tile to zoom; layout adapts to fill the screen.</p>
 <div class="video-wall layout-{{ cameras|length }}">
   {% for cam in cameras %}
   <div class="tile" onclick="zoomExclusive(this)">
@@ -10,26 +31,36 @@
       <span class="badge">ID {{ cam.id }}</span>
       <span class="name">{{ cam.name }}</span>
     </div>
-    <img src="/video_feed/{{ cam.id }}" alt="{{ cam.name }}" style="width: 100%; height: auto; object-fit: cover;"/>
+    {% if pipelines_running %}
+      <img src="/video_feed/{{ cam.id }}"
+           alt="{{ cam.name }}"
+           onerror="this.onerror=null; this.src='/static/camera_offline.jpg';"
+           style="width:100%; height:100%; object-fit:cover;"/>
+    {% else %}
+      <div class="placeholder">Starting…</div>
+    {% endif %}
   </div>
   {% endfor %}
 
-  {# Pad with empty tiles to complete the grid #}
+  {# Pad with empty tile to complete the grid if needed #}
   {% set count = cameras|length %}
   {% if count not in [1,2,4,6,9,12,15,18,21] %}
   <div class="tile empty"></div>
   {% endif %}
 </div>
+{% else %}
+<div class="empty-monitor">
+  <p>No cameras configured yet.</p>
+  <a href="/register" class="button">Add cameras</a>
+</div>
+{% endif %}
 
 <script>
 function zoomExclusive(clickedTile) {
-  const tiles = document.querySelectorAll('.tile');
-  tiles.forEach(tile => {
-    if (tile === clickedTile) {
-      tile.classList.toggle('zoom');
-    } else {
-      tile.classList.remove('zoom');
-    }
+  document.querySelectorAll('.tile').forEach(tile => {
+    tile.classList.toggle('zoom', tile === clickedTile
+      ? !clickedTile.classList.contains('zoom')
+      : false);
   });
 }
 </script>

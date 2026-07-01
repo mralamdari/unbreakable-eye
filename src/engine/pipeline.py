@@ -3,17 +3,65 @@ import cv2
 import time
 import queue
 import psutil
+import functools
 import numpy as np
 import supervision as sv
 from loguru import logger
+from PIL import Image, ImageDraw, ImageFont
 from collections import defaultdict
 from src.core.config import settings
 from src.vision.factory import get_detector
 from src.vision.utils import create_session, preprocess_crop
-from src.core.database import  fast_min_dist_to_customer
+# fast_min_dist_to_customer is called inside db_writer, not pipeline
 from multiprocessing import shared_memory
 
 SKIP_FRAME = (None, None, None, None)
+
+# ─────────────────────────────────────────────────────────────────────────
+# CLIENT-FACING OVERLAY CONFIG
+#
+# SHOW_DEBUG_INFO=False renders the clean, branded overlay meant for
+# clients/demos: no tracker ids, no confidence scores, no raw FPS counter,
+# no customer db ids on screen. Flip to True to get the old ops/debug view
+# back (tracker id + confidence + customer id labels, raw FPS, full-frame
+# zone outline) — useful when you're the one watching the feed, not a client.
+# ─────────────────────────────────────────────────────────────────────────
+SHOW_DEBUG_INFO = False
+
+# Modern, muted palette (not supervision's default neon) — one color per
+# tracked person via color_lookup=TRACK, so two people on screen never look
+# identical the way they did with the default class-based coloring.
+OVERLAY_PALETTE_HEX = [
+    "#2EC4B6",  # teal
+    "#5C6BC0",  # indigo
+    "#FF7F66",  # coral
+    "#66BB6A",  # sage green
+    "#AB47BC",  # plum
+    "#26C6DA",  # cyan
+    "#EC7063",  # rose
+    "#42A5F5",  # sky blue
+]
+LOITER_COLOR_HEX = "#FFB627"   # amber — extended-dwell flag, deliberately not alarming red
+
+# Bundle a real font with the repo — headless Docker images have no system
+# fonts, and cv2's built-in Hershey font is what was making labels look
+# "robotic"/blurry. Get e.g. Inter or Poppins SemiBold (Google Fonts, free)
+# and drop it at this path. If it's missing we fall back to a basic PIL
+# bitmap font and log a warning instead of crashing the pipeline.
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+FONT_PATH = os.path.join(FONT_DIR, "Inter-SemiBold.ttf")
+
+
+@functools.lru_cache(maxsize=8)
+def _load_font(path: str, size: int):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        logger.warning(
+            f"Overlay font not found at {path} — using low-quality fallback font. "
+            f"Add a .ttf there for production-quality text rendering."
+        )
+        return ImageFont.load_default()
 
 def pin_process(cores):
     try:
@@ -137,26 +185,61 @@ class VisionPipeline:
         self.db_queue   = db_queue
         self.response_queue = response_queue
         self.buffer_slots = buffer_slots
-        
-        # Frame shape is fixed system-wide — no need to probe the stream
-        self.frame_shape = settings.FRAME_SHAPE   # (512, 512, 3) — fixed
-        self.frame_bytes = settings.FRAME_BYTES   # fixed
-        self.online = True                        # reader handles offline state
-    
-        # INPUT SHM
+
+        # Inference resolution — input ring shared with the detector
+        self.frame_shape = settings.FRAME_SHAPE   # e.g. (512, 512, 3)
+        self.frame_bytes = settings.FRAME_BYTES
+
+        # Display resolution — output SHM holds one full-res annotated frame
+        # The embedder upscales annotated frames to this shape before writing.
+        self.display_shape = settings.DISPLAY_SHAPE   # (1080, 1920, 3)
+        self.display_bytes = settings.DISPLAY_BYTES   # 1920 * 1080 * 3
+
+        self.online = True   # reader handles offline state
+
+        # INPUT SHM: ring buffer at inference resolution
         self.input_shm = shared_memory.SharedMemory(
             create=True,
             size=self.frame_bytes * buffer_slots)
         self.input_shm_name = self.input_shm.name
 
-        # OUTPUT SHM (ONLY ONE FRAME)
+        # OUTPUT SHM: single frame at display resolution (1920×1080)
         self.output_shm = shared_memory.SharedMemory(
             create=True,
-            size=self.frame_bytes)
-
+            size=self.display_bytes)
         self.output_shm_name = self.output_shm.name
+
+        self._shm_cleaned_up = False   # guard: prevent double close/unlink
         for i in range(buffer_slots):
             self.free_slots.put(i)
+
+        # Shared flag: set to 1 by reader_worker the first time a real frame
+        # is successfully read from the camera. Readable from the main process
+        # via processor.has_frame.value so generate() knows whether to show
+        # the offline image or the live stream.
+        self.has_frame = self.ctx.Value('b', 0)
+
+    def _cleanup_shm(self) -> None:
+        """Close and unlink both SHM blocks exactly once (idempotent)."""
+        if self._shm_cleaned_up:
+            return
+        self._shm_cleaned_up = True
+        for shm in (self.input_shm, self.output_shm):
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        """Fallback cleanup so shm is never leaked if stop() was not called."""
+        try:
+            self._cleanup_shm()
+        except Exception:
+            pass
 
     def start(self):
         self.p_embedder = self.ctx.Process(
@@ -166,6 +249,8 @@ class VisionPipeline:
                 self.output_shm_name,
                 self.frame_shape,
                 self.frame_bytes,
+                self.display_shape,
+                self.display_bytes,
                 self.det_queue,
                 self.free_slots,
                 self.stop_event,
@@ -188,6 +273,7 @@ class VisionPipeline:
                 self.frame_ready_queue,
                 self.det_queue,
                 self.stop_event,
+                self.has_frame,
             ),
             daemon=True
         )
@@ -196,26 +282,34 @@ class VisionPipeline:
 
         
     def stop(self):
+        # Signal THIS camera's reader and embedder only.
+        # stop_event is per-camera — calling this never affects other cameras.
         self.stop_event.set()
-        # Do NOT put None into frame_ready_queue — it is shared across all cameras.
-        # stop_event.set() is the shutdown signal for batched_detector_worker.
+
+        # Unblock embedder_worker if it is waiting on det_queue.get().
+        # Do NOT touch frame_ready_queue — it is shared across ALL cameras
+        # and is consumed by batched_detector_worker. _teardown_sync() kills
+        # the batched_detector first (before calling stop() on any camera)
+        # which drains frame_ready_queue automatically.
         try:
-            self.det_queue.put_nowait(None)   # unblock embedder_worker
-        except:
+            self.det_queue.put_nowait(None)
+        except Exception:
             pass
 
-        self.p_reader.join(timeout=2)
-        self.p_embedder.join(timeout=2)
+        for proc in (getattr(self, "p_reader", None),
+                     getattr(self, "p_embedder", None)):
+            if proc is not None and proc.is_alive():
+                proc.join(timeout=2)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1)
 
-        self.input_shm.close()
-        self.input_shm.unlink()
-
-        self.output_shm.close()
-        self.output_shm.unlink()
+        self._cleanup_shm()
 
     def get_latest_frame(self):
+        """Return a copy of the latest annotated frame at display resolution."""
         frame = np.ndarray(
-            self.frame_shape,
+            self.display_shape,
             dtype=np.uint8,
             buffer=self.output_shm.buf
         )
@@ -242,6 +336,93 @@ def check_loitering(tracker_id,
             return True
     return False    
 
+def _pill(draw, xy, radius, fill):
+    draw.rounded_rectangle(xy, radius=radius, fill=fill)
+
+
+def draw_hud(frame_bgr, cam_label, in_store_count, alert_count):
+    """
+    Client-facing HUD: two small rounded pills instead of raw debug text
+    floating at fixed pixel coordinates. Sized relative to frame width so
+    it holds up if display resolution ever changes.
+
+    Left pill  : live indicator + camera/store label
+    Right pill : how many people are in frame right now
+    Below-right: amber alert pill, only shown when someone trips the
+                 extended-dwell check (loitering_tracker_ids)
+    """
+    h, w = frame_bgr.shape[:2]
+    font_size = max(16, int(h * 0.02))
+    font = _load_font(FONT_PATH, font_size)
+
+    pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    overlay = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    pad_x, pad_y = int(font_size * 0.9), int(font_size * 0.55)
+    margin = int(w * 0.015)
+    dot_r = max(4, font_size // 5)
+
+    # ── Left pill: live dot + camera label ──
+    left_text = cam_label
+    tb = draw.textbbox((0, 0), left_text, font=font)
+    text_w, text_h = tb[2] - tb[0], tb[3] - tb[1]
+    pill_w = pad_x * 3 + dot_r * 2 + text_w
+    pill_h = text_h + pad_y * 2
+    x0, y0 = margin, margin
+    x1, y1 = x0 + pill_w, y0 + pill_h
+    _pill(draw, [x0, y0, x1, y1], radius=pill_h // 2, fill=(18, 18, 22, 150))
+    dot_cx = x0 + pad_x + dot_r
+    dot_cy = y0 + pill_h // 2
+    draw.ellipse(
+        [dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r],
+        fill=(52, 199, 89, 255),   # green
+    )
+    draw.text(
+        (dot_cx + dot_r + pad_x * 0.6, y0 + pill_h // 2 - text_h // 2 - tb[1]),
+        left_text, font=font, fill=(255, 255, 255, 255),
+    )
+
+    # ── Right pill: live in-store count ──
+    right_text = f"{in_store_count} IN STORE" if in_store_count != 1 else "1 IN STORE"
+    tb2 = draw.textbbox((0, 0), right_text, font=font)
+    text_w2, text_h2 = tb2[2] - tb2[0], tb2[3] - tb2[1]
+    pill_w2 = pad_x * 2 + text_w2
+    pill_h2 = text_h2 + pad_y * 2
+    rx1 = w - margin
+    rx0 = rx1 - pill_w2
+    ry0 = margin
+    ry1 = ry0 + pill_h2
+    _pill(draw, [rx0, ry0, rx1, ry1], radius=pill_h2 // 2, fill=(18, 18, 22, 150))
+    draw.text(
+        (rx0 + pad_x, ry0 + pill_h2 // 2 - text_h2 // 2 - tb2[1]),
+        right_text, font=font, fill=(255, 255, 255, 255),
+    )
+
+    # ── Optional alert pill, directly under the count pill ──
+    if alert_count > 0:
+        alert_text = (
+            f"{alert_count} EXTENDED DWELL" if alert_count != 1 else "EXTENDED DWELL"
+        )
+        tb3 = draw.textbbox((0, 0), alert_text, font=font)
+        text_w3, text_h3 = tb3[2] - tb3[0], tb3[3] - tb3[1]
+        pill_w3 = pad_x * 2 + text_w3
+        pill_h3 = text_h3 + pad_y * 2
+        ax1 = w - margin
+        ax0 = ax1 - pill_w3
+        ay0 = ry1 + int(pad_y * 0.7)
+        ay1 = ay0 + pill_h3
+        r, g, b = tuple(int(LOITER_COLOR_HEX.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        _pill(draw, [ax0, ay0, ax1, ay1], radius=pill_h3 // 2, fill=(r, g, b, 210))
+        draw.text(
+            (ax0 + pad_x, ay0 + pill_h3 // 2 - text_h3 // 2 - tb3[1]),
+            alert_text, font=font, fill=(20, 20, 20, 255),
+        )
+
+    composed = Image.alpha_composite(pil_img, overlay).convert("RGB")
+    return cv2.cvtColor(np.array(composed), cv2.COLOR_RGB2BGR)
+
+
 def process_frame(
     frame,
     detections,
@@ -263,20 +444,41 @@ def process_frame(
     track_positions,
     unique_visitors,
     run_embedding,
+    corner_annotator=None,
+    loiter_corner_annotator=None,
+    loiter_trace_annotator=None,
+    cam_label=None,
+    display_frame=None,
+    scale=(1.0, 1.0),
     person_class_id=0
 ):
-    # ── 0. Guard ──
+    # `frame` stays at native inference resolution end-to-end — it's what
+    # embedding crops and zone/dwell logic are computed against, exactly as
+    # before (zero change to re-id quality). `display_frame`, if given, is
+    # the same frame pre-upscaled to display resolution; all DRAWING happens
+    # on that, with box coordinates scaled to match, so lines/text render
+    # crisp instead of being drawn small and then blown up afterward.
+    render_base = display_frame if display_frame is not None else frame
+    cam_label = cam_label or f"CAM {cam_id}"
+
+    # ── 0. Guard — nobody in frame ──
     if detections is None or len(detections) == 0:
         fps_monitor.tick()
-        annotated = sv.draw_text(
-            scene=frame.copy(),
-            text=f"FPS: {fps_monitor.fps:.1f}",
-            text_anchor=sv.Point(x=20, y=40),
-            text_color=sv.Color.WHITE,
-            text_scale=0.7,
-            text_thickness=2,
-            background_color=sv.Color.BLACK
-        )
+        if SHOW_DEBUG_INFO:
+            # NOTE: text_anchor is the CENTER of the text, not top-left — this is
+            # why the old x=40 clipped the "F" off "FPS:" in your screenshots.
+            # x=160 gives enough left margin for the string to render in full.
+            annotated = sv.draw_text(
+                scene=render_base.copy(),
+                text=f"FPS: {fps_monitor.fps:.1f}",
+                text_anchor=sv.Point(x=160, y=60),
+                text_color=sv.Color.WHITE,
+                text_scale=1,
+                text_thickness=1,
+                background_color=sv.Color.BLACK
+            )
+        else:
+            annotated = draw_hud(render_base.copy(), cam_label, in_store_count=0, alert_count=0)
         return annotated
 
     # ── 1. Filter & Track ──
@@ -305,8 +507,15 @@ def process_frame(
                 zone_dwell_total[tid] += elapsed
                 logger.debug(f"Tracker {tid} left zone {zone_idx} after {elapsed:.1f}s")
 
-        frame = zone_box_ann.annotate(scene=frame, detections=detections_in_zone)
-        frame = zone_annotator.annotate(scene=frame)
+        # Dwell-time bookkeeping above always runs — it's real data feeding the
+        # HUD alert pill. The visual outline below is skipped in client mode:
+        # right now `zones` is a single polygon covering the entire frame, so
+        # drawing its border is just a colored rectangle around the whole
+        # picture with no informational value. Worth defining real sub-regions
+        # (entrance, checkout lanes, etc.) before turning this back on.
+        if SHOW_DEBUG_INFO:
+            frame = zone_box_ann.annotate(scene=frame, detections=detections_in_zone)
+            frame = zone_annotator.annotate(scene=frame)
 
     # ── 3. Crop collection ──
     crops_onnx, crop_meta = [], []
@@ -407,60 +616,73 @@ def process_frame(
             labels.append(f"#Track:{int(tracker_id)} ?")
 
     # ── 6. Annotate ──
-    annotated = frame.copy()
+    # Build a display-resolution copy of detections for drawing only — crop
+    # and zone/dwell logic above already ran against the original native-
+    # resolution `detections` and is untouched by this.
+    scale_x, scale_y = scale
+    if len(detections) > 0 and (scale_x != 1.0 or scale_y != 1.0):
+        display_xyxy = detections.xyxy.astype(np.float32) * np.array(
+            [scale_x, scale_y, scale_x, scale_y], dtype=np.float32)
+    else:
+        display_xyxy = detections.xyxy
+    display_detections = sv.Detections(
+        xyxy=display_xyxy,
+        confidence=detections.confidence,
+        class_id=detections.class_id,
+        tracker_id=detections.tracker_id,
+    )
+
+    annotated = render_base.copy()
+
     if len(detections) > 0:
-        annotated = trace_annotator.annotate(annotated, detections)
-        annotated = box_annotator.annotate(annotated, detections)
-        annotated = label_annotator.annotate(annotated, detections, labels)
+        if SHOW_DEBUG_INFO:
+            # Old ops view: solid boxes + tracker id / confidence / customer id
+            annotated = trace_annotator.annotate(annotated, display_detections)
+            annotated = box_annotator.annotate(annotated, display_detections)
+            annotated = label_annotator.annotate(annotated, display_detections, labels)
+        else:
+            # Client view: corner-bracket boxes, one color per person via
+            # color_lookup=TRACK (set on corner_annotator/trace_annotator in
+            # embedder_worker), amber for anyone flagged as loitering. No
+            # tracker ids, no confidence scores, no db customer ids on screen.
+            tracker_ids = display_detections.tracker_id
+            is_loitering = np.array(
+                [tid is not None and tid in loitering_tracker_ids for tid in tracker_ids]
+            )
+
+            normal_dets = display_detections[~is_loitering]
+            loiter_dets = display_detections[is_loitering]
+
+            if len(normal_dets) > 0:
+                annotated = trace_annotator.annotate(annotated, normal_dets)
+                annotated = corner_annotator.annotate(annotated, normal_dets)
+            if len(loiter_dets) > 0:
+                annotated = loiter_trace_annotator.annotate(annotated, loiter_dets)
+                annotated = loiter_corner_annotator.annotate(annotated, loiter_dets)
 
     fps_monitor.tick()
-    annotated = sv.draw_text(
-        scene=annotated,
-        text=f"FPS: {fps_monitor.fps:.1f}",
-        text_anchor=sv.Point(x=20, y=40),
-        text_color=sv.Color.WHITE,
-        text_scale=0.7,
-        text_thickness=2,
-        background_color=sv.Color.BLACK
-    )
+
+    if SHOW_DEBUG_INFO:
+        # NOTE: text_anchor is the CENTER of the text — x=160 keeps it fully
+        # on screen (the old x=40 clipped the "F" off "FPS:" in your screenshots).
+        annotated = sv.draw_text(
+            scene=annotated,
+            text=f"FPS: {fps_monitor.fps:.1f}",
+            text_anchor=sv.Point(x=160, y=60),
+            text_color=sv.Color.WHITE,
+            text_scale=1,
+            text_thickness=1,
+            background_color=sv.Color.BLACK
+        )
+    else:
+        annotated = draw_hud(
+            annotated,
+            cam_label,
+            in_store_count=len(detections),
+            alert_count=len(loitering_tracker_ids),
+        )
+
     return annotated
-
-def detector_worker(
-    shm_name,
-    frame_shape,
-    frame_bytes,
-    frame_ready_queue,
-    det_queue,
-    free_slots,
-    stop_event
-):
-    pin_process([1,2,3])
-    shm = shared_memory.SharedMemory(name=shm_name)
-    detector_model = get_detector()
-    while not stop_event.is_set():
-        try:
-            idx = frame_ready_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
-
-        if idx is None:
-            break
-
-        frame = frame_view(shm,frame_shape,frame_bytes,idx)
-        detections = detector_model.predict(frame)
-        try:
-            det_queue.put_nowait((
-            idx,
-            detections.xyxy,
-            detections.confidence,
-            detections.class_id
-        ))
-        except queue.Full:
-            try:
-                free_slots.put_nowait(idx)
-            except:
-                pass
-    shm.close()
 
 # How the backoff works:
 # First failure → wait 1 s, then retry.
@@ -477,19 +699,34 @@ def reader_worker(rtsp_url,
                   free_slots,
                   frame_ready_queue,
                   det_queue,
-                  stop_event):
+                  stop_event,
+                  has_frame):
     pin_process([0])
     shm = shared_memory.SharedMemory(name=shm_name)
+
+    # frame_shape is (H, W, C) — e.g. (1080, 1920, 3)
+    target_h, target_w = frame_shape[0], frame_shape[1]
 
     cap = None
     first_attempt = True
     online = False
     consecutive_failures = 0
     max_backoff = 60.0
-    offline_frame = np.zeros(frame_shape, dtype=np.uint8)
-    cv2.putText(offline_frame, "Stream offline", (50, 240),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    frame_counter = 0
+    FREEZE_TIMEOUT = 5.0   # seconds without a new frame → treat as failure
+    last_frame_time = time.time()
+
+    def _open_capture(url):
+        """Open VideoCapture and request target resolution + minimal buffering."""
+        c = cv2.VideoCapture(url)
+        if not c.isOpened():
+            return None
+        # Ask driver for target resolution — most RTSP/USB cameras honour this.
+        c.set(cv2.CAP_PROP_FRAME_WIDTH,  target_w)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+        # Keep OpenCV internal buffer at 1 frame so we always read the newest frame,
+        # not a frame that was decoded 200 ms ago sitting in a 10-frame buffer.
+        c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return c
 
     while not stop_event.is_set():
         if not online:
@@ -507,10 +744,9 @@ def reader_worker(rtsp_url,
             if stop_event.is_set():
                 break
 
-            cap = cv2.VideoCapture(rtsp_url)
-            if not cap.isOpened():
+            cap = _open_capture(rtsp_url)
+            if cap is None:
                 consecutive_failures += 1
-                # Signal embedder that stream is offline
                 try:
                     det_queue.put_nowait((None, None, None, None))
                 except queue.Full:
@@ -519,6 +755,18 @@ def reader_worker(rtsp_url,
 
             online = True
             consecutive_failures = 0
+            last_frame_time = time.time()
+
+        # Stall guard — if cap.read() blocks or the stream freezes, reconnect.
+        if time.time() - last_frame_time > FREEZE_TIMEOUT:
+            logger.warning(f"Camera {cam_id}: stream frozen for {FREEZE_TIMEOUT}s, reconnecting")
+            online = False
+            consecutive_failures += 1
+            try:
+                det_queue.put_nowait((None, None, None, None))
+            except queue.Full:
+                pass
+            continue
 
         ret, frame = cap.read()
         if not ret:
@@ -530,29 +778,28 @@ def reader_worker(rtsp_url,
                 pass
             continue
 
-        frame_counter += 1
+        last_frame_time = time.time()
         consecutive_failures = 0
 
-        if frame_counter % 3 == 0:
-            # Keyframe — needs a real slot
-            try:
-                idx = free_slots.get_nowait()
-            except queue.Empty:
-                # No slot available, detector is backed up — drop this keyframe
-                # Don't crash, don't block, just skip
-                continue
-            _write_frame_to_slot(shm, idx, frame, frame_shape, frame_bytes)
-            try:
-                frame_ready_queue.put_nowait((cam_id, idx))
-            except queue.Full:
-                # Detector queue full — return slot immediately
-                free_slots.put_nowait(idx)
-        else:
-            # Skipped frame — no slot needed at all
-            try:
-                det_queue.put_nowait(SKIP_FRAME)
-            except queue.Full:
-                pass  # embedder backed up, drop the signal
+        # Signal to generate() in main.py that at least one real frame
+        # arrived — switches the MJPEG stream from the offline image to live.
+        if not has_frame.value:
+            has_frame.value = 1
+
+        # Every decoded frame goes to the detector.
+        # If no slot is free, the detector is backed up — drop this frame and
+        # keep reading so the reader never blocks the capture loop.
+        try:
+            idx = free_slots.get_nowait()
+        except queue.Empty:
+            continue   # drop frame; don't stall
+
+        _write_frame_to_slot(shm, idx, frame, frame_shape, frame_bytes)
+        try:
+            frame_ready_queue.put_nowait((cam_id, idx))
+        except queue.Full:
+            # Detector input queue full — return slot immediately.
+            free_slots.put_nowait(idx)
 
     if cap is not None:
         cap.release()
@@ -563,6 +810,8 @@ def embedder_worker(
     output_shm_name,
     frame_shape,
     frame_bytes,
+    display_shape,
+    display_bytes,
     det_queue,
     free_slots,
     stop_event,
@@ -574,27 +823,63 @@ def embedder_worker(
     input_shm = shared_memory.SharedMemory(name=input_shm_name)
     output_shm = shared_memory.SharedMemory(name=output_shm_name)
     embedder_session = create_session(settings.FEATURE_EXTRACTOR_MODEL, num_threads=1)
+    # TODO: swap for a real store/location name once that's configurable
+    # per camera (e.g. settings.CAMERA_LABELS[cam_id]) — "CAM 1" is a
+    # placeholder that's still better than nothing on a client-facing feed.
+    cam_label = f"CAM {cam_id}"
     track_to_customer = {}
-    unique_visitors = set()   # persists across frames
-    track_positions = defaultdict(list)   # local to this process — not shared
     unique_visitors = set()   # persists across frames — counts unique tracker IDs seen
+    track_positions = defaultdict(list)   # local to this process — not shared
     tracker = sv.ByteTrack(lost_track_buffer=120) # 120 frames ==> This stops the tracker from killing a track when a person is briefly occluded or missed by the detector.
     fps_monitor = sv.FPSMonitor()
-    color = sv.ColorPalette.DEFAULT
-    box_annotator = sv.EllipseAnnotator(color=color)
-    trace_annotator = sv.TraceAnnotator(color=color, trace_length=30)
-    label_annotator = sv.LabelAnnotator(color=color, text_color=sv.Color.BLACK)
-    
-    colors = sv.ColorPalette.DEFAULT
-    h,w,c = frame_shape
-    # Build the full‑frame polygon (top‑left → top‑right → bottom‑right → bottom‑left)
 
+    # Line/text weight scaled to display resolution — thickness=1 is fine at
+    # 512×512 but reads as a hairline once the frame is at 1920×1080.
+    dh_px, dw_px, _ = display_shape
+    line_thickness = max(2, round(dh_px * 0.0028))
+    corner_len = round(dh_px * 0.025)
+
+    palette = sv.ColorPalette.from_hex(OVERLAY_PALETTE_HEX)
+    loiter_color = sv.Color.from_hex(LOITER_COLOR_HEX)
+
+    # Old ops/debug annotators (SHOW_DEBUG_INFO=True) — now colored by track
+    # too instead of by class, so even the debug view doesn't paint every
+    # person the same magenta.
+    color = palette
+    box_annotator = sv.BoxAnnotator(color=color, color_lookup=sv.ColorLookup.TRACK,
+                                     thickness=line_thickness)
+    trace_annotator = sv.TraceAnnotator(color=color, color_lookup=sv.ColorLookup.TRACK,
+                                         trace_length=30, thickness=line_thickness)
+    label_annotator = sv.LabelAnnotator(color=color, color_lookup=sv.ColorLookup.TRACK,
+                                         text_color=sv.Color.BLACK)
+
+    # Client-facing annotators — corner brackets instead of solid boxes read
+    # as a modern "tracking" indicator rather than a debug bounding box, and
+    # they don't visually collide with each other in crowded frames the way
+    # filled/labeled boxes did in your screenshots.
+    corner_annotator = sv.BoxCornerAnnotator(
+        color=palette, color_lookup=sv.ColorLookup.TRACK,
+        thickness=line_thickness, corner_length=corner_len,
+    )
+    loiter_corner_annotator = sv.BoxCornerAnnotator(
+        color=loiter_color, thickness=line_thickness + 1, corner_length=corner_len,
+    )
+    loiter_trace_annotator = sv.TraceAnnotator(
+        color=loiter_color, trace_length=30, thickness=line_thickness,
+    )
+
+    colors = sv.ColorPalette.DEFAULT
+    # Zones must be defined in DISPLAY resolution coordinates — the annotated
+    # frame written to output_shm is at display_shape, not frame_shape.
+    # Using frame_shape (512×512) here caused zones and box annotations to
+    # appear only in the top-left corner of the 1920×1080 output frame.
+    dh, dw, _ = display_shape
     polygons = [
-            np.array([
-            [0, 0],
-            [w, 0],
-            [w, h],
-            [0, h]
+        np.array([
+            [0,   0  ],
+            [dw,  0  ],
+            [dw,  dh ],
+            [0,   dh ],
         ], dtype=np.int32)
     ]
 
@@ -605,15 +890,15 @@ def embedder_worker(
         sv.PolygonZoneAnnotator(
             zone=zone,
             color=colors.by_idx(index),
-            thickness=4,
-            text_thickness=8,
-            text_scale=4
+            thickness=1,
+            text_thickness=2,
+            text_scale=1
         ) for index, zone in enumerate(zones)]
      
     zone_box_annotators = [
         sv.BoxAnnotator(
             color=colors.by_idx(index),
-            thickness=4,
+            thickness=1,
         ) for index in range(len(polygons))]
     
     # dwell time tracking
@@ -631,15 +916,16 @@ def embedder_worker(
 
         idx, xyxy, confidence, class_id = item  # always 4 values now
 
-        # Skipped frame path
+        # Skipped frame path — output_shm already holds the last annotated frame.
+        # Do NOT re-run process_frame: that caused the 120fps spin (embedder racing
+        # through skipped frames, re-annotating the same pixels repeatedly) which
+        # made FPSMonitor report inflated numbers while the browser received a
+        # frozen image that only jumped when a real detection batch arrived.
+        # Simply skip — the MJPEG generator reads output_shm directly and will
+        # keep streaming the last good frame until a new one arrives.
         if idx is None:
-            # No shared memory involved — reuse last state
-            detections    = last_valid_detections
-            run_embedding = False
-            # Read last annotated frame from output shm for re-display
-            frame = np.ndarray(
-                frame_shape, dtype=np.uint8, buffer=output_shm.buf
-            ).copy()
+            continue
+
         else:
             # Real frame path
             frame = frame_view(input_shm, frame_shape, frame_bytes, idx).copy()
@@ -661,14 +947,38 @@ def embedder_worker(
             except queue.Full:
                 pass  # should never happen but don't crash
 
+        # Upscale to display resolution BEFORE drawing anything — this is the
+        # fix for the blurry/pixelated boxes and text: previously everything
+        # was drawn at frame_shape (e.g. 512×512) and the whole already-
+        # annotated image was upscaled afterward, softening every line and
+        # letter. `frame` (native res) still goes to process_frame unchanged
+        # for embedding crops; only the drawing surface + box coordinates
+        # are scaled.
+        if frame.shape[:2] != (display_shape[0], display_shape[1]):
+            render_frame = cv2.resize(
+                frame,
+                (display_shape[1], display_shape[0]),   # (W, H) for cv2
+                interpolation=cv2.INTER_LINEAR,
+            )
+            render_scale = (
+                display_shape[1] / frame_shape[1],
+                display_shape[0] / frame_shape[0],
+            )
+        else:
+            render_frame = frame
+            render_scale = (1.0, 1.0)
+
         annotated = process_frame(
             frame=frame,
+            display_frame=render_frame,
+            scale=render_scale,
             detections=detections,
             tracker=tracker,
             embedder_session=embedder_session,
             track_to_customer=track_to_customer,
             db_queue=db_queue,
             cam_id=cam_id,
+            cam_label=cam_label,
             unique_visitors=unique_visitors,
             zones=zones,
             zone_annotators=zone_annotators,
@@ -676,6 +986,9 @@ def embedder_worker(
             dwell_total=dwell_total,
             fps_monitor=fps_monitor,
             box_annotator=box_annotator,
+            corner_annotator=corner_annotator,
+            loiter_corner_annotator=loiter_corner_annotator,
+            loiter_trace_annotator=loiter_trace_annotator,
             zone_box_annotators=zone_box_annotators,
             track_positions=track_positions,
             response_queue=response_queue,
@@ -684,9 +997,10 @@ def embedder_worker(
             run_embedding=run_embedding
         )
 
-        # Write annotated frame to output shared memory
-        output_frame = np.ndarray(frame_shape, dtype=np.uint8, buffer=output_shm.buf)
-        np.copyto(output_frame, annotated)
+        # annotated is already at display resolution — process_frame drew
+        # directly onto render_frame, no second resize needed here.
+        output_buf = np.ndarray(display_shape, dtype=np.uint8, buffer=output_shm.buf)
+        np.copyto(output_buf, annotated)
 
     input_shm.close()
     output_shm.close()
@@ -711,6 +1025,13 @@ def batched_detector_worker(
         cam_id: shared_memory.SharedMemory(name=name)
         for cam_id, name in shm_names.items()
     }
+    # n_cams is read at spawn time from the dict snapshot — this is the correct
+    # number of cameras this detector instance was started for. Do NOT use
+    # len(shm_blocks) inside the loop as a wait target; use it only as the
+    # max batch size. Waiting for exactly n_cams frames would deadlock if a
+    # camera is removed and its reader stops producing — but since we restart
+    # the batched detector on every add/remove, n_cams is always accurate for
+    # the lifetime of this process.
     n_cams     = len(shm_blocks)
     detector   = get_detector()   # one YOLO session for ALL cameras
 
@@ -764,3 +1085,4 @@ def batched_detector_worker(
 
     for shm in shm_blocks.values():
         shm.close() 
+        

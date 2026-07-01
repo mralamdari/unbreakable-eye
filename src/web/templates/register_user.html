@@ -1,9 +1,16 @@
+<!-- templates/register_user.html -->
 {% extends "base.html" %}
 {% block content %}
-<h2>Create Account</h2>
-<form method="post" class="form">
-  <label>Username <input type="text" name="username" required></label>
-  <label>Password <input type="password" name="password" required></label>
-  <button type="submit" class="button">Register</button>
-</form>
+<div class="auth-page">
+  <div class="panel">
+    <h2>Create your account</h2>
+    <p class="auth-sub">Set up a login to start managing your cameras.</p>
+    <form method="post" class="form">
+      <label>Username <input type="text" name="username" autocomplete="username" required></label>
+      <label>Password <input type="password" name="password" autocomplete="new-password" required></label>
+      <button type="submit" class="button button-block">Create account</button>
+    </form>
+  </div>
+  <p class="auth-switch">Already have an account? <a href="/login">Log in</a></p>
+</div>
 {% endblock %}

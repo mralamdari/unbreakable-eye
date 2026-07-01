@@ -1,75 +1,60 @@
+"""
+main.py — FastAPI application entry point.
+
+Manages:
+  - Auth (session signing via itsdangerous, bcrypt via passlib)
+  - Camera registration and pipeline lifecycle
+  - MJPEG video streaming
+  - JSON API for the frontend dashboard
+
+Database backend: PostgreSQL via psycopg2.
+All blocking DB calls are offloaded via run_db() to avoid blocking the event loop.
+"""
+
 import os
 import cv2
 import time
 import json
 import asyncio
-import sqlite3
 import uvicorn
+import numpy as np
 from loguru import logger
 import multiprocessing as mp
-from functools import partial
+from contextlib import asynccontextmanager
+
+import psycopg2
+import psycopg2.errors
+
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from passlib.context import CryptContext
-from src.core.config import settings
-from starlette.requests import Request
-from src.core.logging import setup_logging
-from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request, Form, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+
+from src.core.config import settings
+from src.core.logging import setup_logging
 from src.core.db_writer import start_db_writer
-from fastapi import FastAPI, HTTPException, Request, Form, Response
-from src.core.database import init_db, load_cache, read_connection, write_connection
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from src.core.database import init_db, load_cache, get_connection, write_connection
 from src.engine.pipeline import VisionPipeline, batched_detector_worker
 
 
-# ```
-# ┌─────────────────────────────────┐
-# │  inference engine (your code)   │  Pure Python, no web framework
-# │  pipeline.py, db_writer.py      │  Writes output to shared state
-# └──────────────┬──────────────────┘
-#                │ reads
-# ┌──────────────▼──────────────────┐
-# │  FastAPI — JSON API only        │  Thin, async, no templates
-# │  /api/cameras  /api/state       │  Serves React/Vue SPA
-# │  /api/stream/{cam_id}           │
-# └──────────────┬──────────────────┘
-#                │ served to
-# ┌──────────────▼──────────────────┐
-# │  Frontend — React or plain HTML │  Static files, CDN or nginx
-# │  Fetches /api/state every 2s    │  WebSocket for live alerts
-# └─────────────────────────────────┘
-# ```
-
-# On an edge device, run nginx in front. Nginx serves static files at zero CPU cost, proxies `/api/*` to FastAPI, and handles MJPEG streams efficiently.
-
-
-# New code uses `itsdangerous.URLSafeTimedSerializer` with your `settings.SECRET_KEY`. The session cookie is **HMAC-signed** — if anyone tampers with it, `_verify_session` raises `BadSignature` and returns `None`. Tokens also expire after 8 hours via `SignatureExpired`. The cookie is `httponly=True` so JavaScript can't read it at all.
-
-# You need to add `SECRET_KEY` to your config. Generate it once: `python -c "import secrets; print(secrets.token_hex(32))"` and put it in your `.env`.
-
-# `werkzeug` is gone. `passlib` with bcrypt replaces `generate_password_hash`/`check_password_hash`. Same security, no Flask dependency.
-
-# ---------------------------------------------------------------------------
-# Security helpers
-# ---------------------------------------------------------------------------
-pwd_ctx    = CryptContext(schemes=["bcrypt"], deprecated="auto")
-_signer    = URLSafeTimedSerializer(settings.SECRET_KEY)   # add SECRET_KEY to config
-SESSION_COOKIE = "session"
+# ─────────────────────────────────────────────────────────────────────────────
+# Security
+# ─────────────────────────────────────────────────────────────────────────────
+pwd_ctx         = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_signer         = URLSafeTimedSerializer(settings.SECRET_KEY)
+SESSION_COOKIE  = "session"
 SESSION_MAX_AGE = 60 * 60 * 8   # 8 hours
 
 
 def _sign_session(user_id: int) -> str:
-    """Create a tamper-proof signed session token."""
     return _signer.dumps({"uid": user_id})
 
 
 def _verify_session(token: str) -> int | None:
-    """
-    Verify and decode the session token.
-    Returns user_id or None if invalid/expired.
-    Tokens expire after SESSION_MAX_AGE seconds.
-    """
     try:
         data = _signer.loads(token, max_age=SESSION_MAX_AGE)
         return int(data["uid"])
@@ -78,37 +63,26 @@ def _verify_session(token: str) -> int | None:
 
 
 def get_current_user(request: Request) -> int | None:
-    """Return user_id from signed cookie, or None if not authenticated."""
     token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return None
-    return _verify_session(token)
+    return _verify_session(token) if token else None
 
 
 def require_login(request: Request) -> int:
-    """
-    Dependency for endpoints that need auth.
-    Raises HTTPException(401) if not logged in.
-    Use as: user_id = require_login(request)
-    For redirect-based pages, call get_current_user() and redirect manually.
-    """
     uid = get_current_user(request)
     if uid is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return uid
 
 
-# ---------------------------------------------------------------------------
-# Flash message helpers (unchanged logic, kept as-is)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Flash messages
+# ─────────────────────────────────────────────────────────────────────────────
 def flash_message(response: Response, message: str, category: str = "info"):
     import datetime
     expires = datetime.datetime.now() + datetime.timedelta(seconds=20)
     payload = json.dumps({"message": message, "category": category})
     response.set_cookie(
-        key="flash_msg",
-        value=payload,
-        max_age=10,
+        key="flash_msg", value=payload, max_age=10,
         expires=expires.strftime("%a, %d %b %Y %H:%M:%S GMT"),
         samesite="lax",
     )
@@ -128,49 +102,39 @@ def clear_flash_message(response: Response):
     response.delete_cookie("flash_msg")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Async DB helper
-# Blocking SQLite calls must NOT run on the event loop thread.
-# run_in_executor offloads them to a thread pool.
-# ---------------------------------------------------------------------------
+# Blocking psycopg2 calls must NOT run on the event loop thread.
+# run_in_executor offloads them to the thread pool.
+# ─────────────────────────────────────────────────────────────────────────────
 async def run_db(fn, *args):
-    """
-    Run a blocking DB function in a thread pool so FastAPI's event loop
-    is not blocked.
-
-    Usage:
-        rows = await run_db(lambda: conn.execute(...).fetchall())
-
-    For write operations:
-        await run_db(lambda: _do_write())
-    """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, fn)
+    return await loop.run_in_executor(None, fn, *args)
 
-# ---------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Global pipeline state
-# ---------------------------------------------------------------------------
-processors        = {}
+# ─────────────────────────────────────────────────────────────────────────────
+processors        = {}   # cam_id -> VisionPipeline (running pipelines only)
 batched_det_proc  = None
 frame_ready_queue = None
 det_queues        = {}
 free_slots_queues = {}
 shm_names         = {}
 response_queues   = {}
+stop_events       = {}   # cam_id -> per-camera CTX.Event
 CTX               = None
 db_queue          = None
 db_writer_proc    = None
-stop_event        = None
+global_stop_event = None  # signals batched_detector + final app shutdown only
+cameras_dirty     = False  # True when DB camera list changed since last apply
+_pipelines_booted = False  # set True once apply_changes has run since process start
 
-# ---------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline management
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 def _start_batched_detector() -> mp.Process:
-    """
-    Start the shared YOLO detector process.
-    MUST be called only after all cameras are registered in
-    det_queues, free_slots_queues, and shm_names.
-    """
     p = CTX.Process(
         target=batched_detector_worker,
         args=(
@@ -180,7 +144,7 @@ def _start_batched_detector() -> mp.Process:
             shm_names,
             settings.FRAME_SHAPE,
             settings.FRAME_BYTES,
-            stop_event,
+            global_stop_event,
         ),
         daemon=True,
     )
@@ -190,7 +154,6 @@ def _start_batched_detector() -> mp.Process:
 
 
 def _stop_batched_detector():
-    """Signal and join the current batched detector process."""
     global batched_det_proc
     if batched_det_proc is not None and batched_det_proc.is_alive():
         batched_det_proc.terminate()
@@ -199,51 +162,16 @@ def _stop_batched_detector():
     batched_det_proc = None
 
 
-# def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
-#     """
-#     Build per-camera queues, register them globally, create VisionPipeline.
-#     Does NOT start worker processes — call proc.start() separately.
-
-#     Order matters:
-#         1. Create queues
-#         2. Register in global dicts   ← batched detector reads these at spawn time
-#         3. Create VisionPipeline      ← allocates shared memory
-#         4. Register shm_name          ← available after step 3
-#     """
-#     free_slots     = CTX.Queue(maxsize=4)
-#     det_queue      = CTX.Queue(maxsize=4)
-#     response_queue = CTX.Queue()
-
-#     det_queues[cam_id]        = det_queue
-#     free_slots_queues[cam_id] = free_slots
-
-#     processor = VisionPipeline(
-#         RTSP_URL=stream_url,
-#         CAM_ID=cam_id,
-#         ctx=CTX,
-#         free_slots=free_slots,
-#         det_queue=det_queue,
-#         stop_event=stop_event,
-#         db_queue=db_queue,
-#         response_queue=response_queue,
-#         frame_ready_queue=frame_ready_queue,
-#     )
-#     shm_names[cam_id] = processor.input_shm_name
-#     return processor
-
-
-# Add this global alongside the others
-response_queues: dict[int, mp.Queue] = {}
-
 def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
     free_slots     = CTX.Queue(maxsize=4)
     det_queue      = CTX.Queue(maxsize=4)
     response_queue = CTX.Queue()
+    cam_stop_event = CTX.Event()   # per-camera — stopping one never affects others
 
-    # Register ALL global dicts before anything starts
     det_queues[cam_id]        = det_queue
     free_slots_queues[cam_id] = free_slots
-    response_queues[cam_id]   = response_queue   # ← register here
+    response_queues[cam_id]   = response_queue
+    stop_events[cam_id]       = cam_stop_event
 
     processor = VisionPipeline(
         RTSP_URL=stream_url,
@@ -251,7 +179,7 @@ def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
         ctx=CTX,
         free_slots=free_slots,
         det_queue=det_queue,
-        stop_event=stop_event,
+        stop_event=cam_stop_event,
         db_queue=db_queue,
         response_queue=response_queue,
         frame_ready_queue=frame_ready_queue,
@@ -259,160 +187,259 @@ def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
     shm_names[cam_id] = processor.input_shm_name
     return processor
 
-# def _restart_batched_detector()():
-#     """
-#     Option A: stop existing detector, start fresh with current dict state.
-#     Call after adding or removing a camera from det_queues/shm_names.
 
-#     Why re-create: mp.Process with spawn context pickles args at creation
-#     time. Dict mutations after spawn are invisible to the subprocess.
-#     Restarting gives it a fresh pickle of the updated dicts.
-#     """
-#     _stop_batched_detector()
-#     global batched_det_proc
-#     batched_det_proc = _start_batched_detector()
+# ─────────────────────────────────────────────────────────────────────────────
+# Three-phase pipeline restart engine
+#
+# The fundamental rule: teardown and startup never overlap, and the
+# event loop is never blocked while processes are being joined.
+#
+# Phase A — _disconnect_streams()
+#   Runs on the event loop. Snapshots and clears processors{} instantly.
+#   Every live generate() loop sees cam_id not in processors on its next
+#   asyncio.sleep() tick (≤33 ms) and breaks, closing the StreamingResponse.
+#   No process is touched. Returns snapshot for Phase B.
+#
+# Phase B — _teardown_sync(snapshot)
+#   Runs in executor thread. Correct dependency order:
+#     1. batched_detector terminated FIRST — immediately unblocks any reader
+#        that is stuck trying to put() into a full frame_ready_queue.
+#     2. Per-camera readers + embedders joined — they exit cleanly now because
+#        the consumer of their output queue is gone.
+#     3. db_writer shut down — safe now because all embedders have stopped.
+#   Clears the remaining module-level dicts.
+#
+# Phase C — _startup_sync(user_cameras)
+#   Runs in the same executor thread, immediately after B.
+#   Rebuilds everything from scratch in correct dependency order:
+#     1. Fresh frame_ready_queue — old one discarded (may have stale items).
+#     2. create_pipeline() per camera — fresh SHM, queues, per-camera event.
+#     3. db_writer started with fully populated response_queues.
+#     4. batched_detector started with fully populated shm_names + det_queues.
+#     5. p_reader + p_embedder started last — begin producing frames.
+#
+# apply_changes(user_cameras)
+#   Async orchestrator. Runs A on event loop, then B+C together in one thread.
+#   Called by: login POST (auto-start on login), /monitor (auto-restart when cameras_dirty).
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _restart_all_workers():
-    """
-    Restart both the batched detector and db_writer with updated dicts.
-    Call after adding or removing a camera.
-    """
+async def _disconnect_streams() -> dict:
+    """Phase A — instant, on the event loop. Clears processors{}."""
+    snapshot = dict(processors)
+    processors.clear()
+    return snapshot
+
+
+def _teardown_sync(snapshot: dict) -> None:
+    """Phase B — blocking, in executor thread. Correct dependency order."""
     global db_writer_proc, batched_det_proc
 
-    # Stop both
+    # 1. Kill batched_detector first — unblocks readers stuck on full queue
     _stop_batched_detector()
-    db_queue.put(None)           # poison pill stops db_writer cleanly
-    db_writer_proc.join(timeout=5)
 
-    # Restart with updated dicts
-    db_writer_proc   = start_db_writer(CTX, db_queue, response_queues)
-    batched_det_proc = _start_batched_detector()
-
-
-# ---------------------------------------------------------------------------
-# Lifespan — startup / shutdown
-# ---------------------------------------------------------------------------
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     global CTX, db_queue, db_writer_proc, frame_ready_queue, stop_event, batched_det_proc
-
-#     CTX               = mp.get_context("spawn")
-#     stop_event        = CTX.Event()
-#     db_queue          = CTX.Queue(maxsize=1024)
-#     frame_ready_queue = CTX.Queue(maxsize=64)
-
-#     db_writer_proc = start_db_writer(CTX, db_queue)
-
-#     # DB init is blocking — do it before the event loop is critical
-#     init_db()
-#     with read_connection() as conn:
-#         load_cache(conn)
-
-#     # Load cameras from DB and register them all before starting detector
-#     with read_connection() as conn:
-#         rows = conn.execute("SELECT id, stream_url FROM cameras").fetchall()
-
-#     for cam_id, stream_url in rows:
-#         try:
-#             proc = create_pipeline(stream_url, cam_id)
-#             processors[cam_id] = proc
-#             logger.info(f"Registered camera {cam_id}: {stream_url}")
-#         except Exception as e:
-#             logger.error(f"Failed to create pipeline for camera {cam_id}: {e}")
-
-#     if processors:
-#         batched_det_proc = _start_batched_detector()
-#         for proc in processors.values():
-#             proc.start()
-#     else:
-#         logger.warning("No cameras registered — batched detector not started")
-
-#     yield
-
-#     # ── Shutdown ──────────────────────────────────────────────────────────
-#     logger.info("Shutting down...")
-#     stop_event.set()
-
-#     for proc in processors.values():
-#         try:
-#             proc.stop()
-#         except Exception as e:
-#             logger.error(f"Error stopping pipeline: {e}")
-
-#     _stop_batched_detector()
-
-#     db_queue.put(None)           # poison pill for db_writer
-#     db_writer_proc.join(timeout=5)
-#     logger.info("Shutdown complete")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global CTX, db_queue, db_writer_proc, frame_ready_queue, stop_event, batched_det_proc
-
-    CTX               = mp.get_context("spawn")
-    stop_event        = CTX.Event()
-    db_queue          = CTX.Queue(maxsize=1024)
-    frame_ready_queue = CTX.Queue(maxsize=64)
-
-    # Load cameras from DB first — needed to build response_queues
-    init_db()
-    with read_connection() as conn:
-        rows = conn.execute(
-            "SELECT id, stream_url FROM cameras"
-        ).fetchall()
-
-    # Register all cameras BEFORE starting db_writer
-    for cam_id, stream_url in rows:
-        try:
-            proc = create_pipeline(stream_url, cam_id)
-            processors[cam_id] = proc
-        except Exception as e:
-            logger.error(f"Failed to create pipeline for camera {cam_id}: {e}")
-
-    # Now response_queues is fully populated — safe to start db_writer
-    db_writer_proc = start_db_writer(CTX, db_queue, response_queues)
-
-    with read_connection() as conn:
-        load_cache(conn)
-
-    if processors:
-        batched_det_proc = _start_batched_detector()
-        for proc in processors.values():
-            proc.start()
-
-    yield
-
-    stop_event.set()
-    for proc in processors.values():
+    # 2. Stop per-camera readers + embedders
+    for cam_id, proc in snapshot.items():
         try:
             proc.stop()
         except Exception as e:
-            logger.error(f"Error stopping pipeline: {e}")
-    _stop_batched_detector()
-    db_queue.put(None)
-    db_writer_proc.join(timeout=5)
+            logger.error(f"Teardown error cam {cam_id}: {e}")
+
+    # 3. Shut down db_writer — safe now that all embedders are dead
+    if db_writer_proc is not None:
+        try:
+            db_queue.put(None, timeout=2)
+            db_writer_proc.join(timeout=5)
+        except Exception as e:
+            logger.error(f"db_writer shutdown error: {e}")
+            if db_writer_proc.is_alive():
+                db_writer_proc.terminate()
+        db_writer_proc = None
+
+    # Clear remaining dicts (processors already cleared in Phase A)
+    det_queues.clear()
+    free_slots_queues.clear()
+    shm_names.clear()
+    response_queues.clear()
+    stop_events.clear()
+    logger.info("Teardown complete")
 
 
-# ---------------------------------------------------------------------------
+def _startup_sync(user_cameras: list) -> None:
+    """Phase C — blocking, in executor thread. Rebuilds from scratch."""
+    global frame_ready_queue, db_writer_proc, batched_det_proc
+
+    if not user_cameras:
+        logger.info("No cameras configured — startup skipped")
+        return
+
+    # 1. Fresh frame_ready_queue — guaranteed empty, no stale items
+    frame_ready_queue = CTX.Queue(maxsize=64)
+
+    # 2. create_pipeline() for every camera
+    for cam in user_cameras:
+        try:
+            proc = create_pipeline(cam["stream_url"], cam["id"])
+            processors[cam["id"]] = proc
+        except Exception as e:
+            logger.error(f"Failed to create pipeline cam {cam['id']}: {e}")
+
+    if not processors:
+        logger.error("No pipelines created — startup aborted")
+        return
+
+    # 3. db_writer with fully populated response_queues
+    db_writer_proc = start_db_writer(CTX, db_queue, response_queues)
+
+    # 4. ONE batched_detector — single YOLO session for all cameras
+    batched_det_proc = _start_batched_detector()
+
+    # 5. Start all readers + embedders simultaneously
+    for proc in processors.values():
+        try:
+            proc.start()
+        except Exception as e:
+            logger.error(f"Failed to start pipeline: {e}")
+
+    logger.info(
+        f"Startup complete — {len(processors)} camera(s) live, "
+        f"1 YOLO session shared across all"
+    )
+
+
+async def apply_changes(user_cameras: list) -> None:
+    """
+    Orchestrates the full three-phase restart.
+
+    Phase A runs on the event loop (instant) — HTTP response is never delayed.
+    Phases B+C run together in one executor thread — blocking joins are hidden
+    from the event loop so streaming connections can close naturally.
+
+    user_cameras: list of {id, stream_url} dicts fetched from DB by the caller.
+    """
+    snapshot = await _disconnect_streams()        # Phase A — instant
+
+    # Give generate() loops one tick to observe the empty processors dict
+    await asyncio.sleep(0.05)
+
+    def _teardown_then_startup():                 # Phases B+C — sequential, one thread
+        _teardown_sync(snapshot)
+        _startup_sync(user_cameras)
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _teardown_then_startup)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifespan — startup / shutdown
+# ─────────────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global CTX, db_queue, db_writer_proc, frame_ready_queue, global_stop_event, batched_det_proc
+
+    CTX               = mp.get_context("spawn")
+    global_stop_event = CTX.Event()
+    db_queue          = CTX.Queue(maxsize=1024)
+    frame_ready_queue = CTX.Queue(maxsize=64)
+
+    init_db()
+
+    with get_connection() as conn:
+        load_cache(conn)
+
+    # db_writer starts at app boot — owns the embedding cache.
+    # Pipelines start on first login via apply_changes().
+    db_writer_proc = start_db_writer(CTX, db_queue, response_queues)
+
+    logger.info("App ready — pipelines will start automatically on login")
+
+    yield
+
+    # ── Shutdown — same dependency order as _teardown_sync ────────────────────
+    logger.info("Shutting down...")
+    global_stop_event.set()
+
+    snapshot = dict(processors)
+    processors.clear()
+
+    _stop_batched_detector()                          # 1. detector first
+    for cam_id, proc in snapshot.items():             # 2. per-camera workers
+        try:
+            proc.stop()
+        except Exception as e:
+            logger.error(f"Shutdown error cam {cam_id}: {e}")
+    if db_writer_proc is not None:                    # 3. db_writer last
+        try:
+            db_queue.put(None, timeout=2)
+            db_writer_proc.join(timeout=5)
+        except Exception:
+            pass
+
+    logger.info("Shutdown complete")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # App setup
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 setup_logging()
 BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app       = FastAPI(lifespan=lifespan, title="ShopVision API", version="2.0.0")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "web", "templates"))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "web", "static")), name="static")
 
+# Load offline image once — served by generate() until has_frame.value is set.
+_offline_path = os.path.join(BASE_DIR, "web", "static", "camera_offline.jpg")
+with open(_offline_path, "rb") as _f:
+    _OFFLINE_JPEG: bytes = _f.read()
+logger.info(f"Offline image loaded ({len(_OFFLINE_JPEG)} bytes): {_offline_path}")
 
-# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def auto_resume_on_restart(request: Request, call_next):
+    """
+    If the app process was restarted (e.g. uvicorn restart, crash recovery,
+    deploy) while the browser still holds a valid session cookie, the user
+    should NOT have to logout/login again to get monitoring running.
+
+    This runs once: the first incoming request after boot that carries a
+    valid session triggers apply_changes() in the background, exactly like
+    do_login() does. Every later request is a no-op pass-through.
+    """
+    global _pipelines_booted
+
+    if not _pipelines_booted:
+        uid = get_current_user(request)
+        if uid is not None:
+            _pipelines_booted = True  # set before await — never trigger twice
+
+            def _fetch_cams():
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT id, stream_url FROM cameras WHERE user_id = %s",
+                            (uid,),
+                        )
+                        return [{"id": r["id"], "stream_url": r["stream_url"]}
+                                for r in cur.fetchall()]
+
+            user_cameras = await run_db(_fetch_cams)
+            asyncio.create_task(apply_changes(user_cameras))
+            logger.info(
+                f"Resumed session detected (uid={uid}) — pipeline startup "
+                f"triggered for {len(user_cameras)} camera(s), no re-login needed"
+            )
+
+    return await call_next(request)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Auth endpoints
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    flash = get_flash_message(request)
+    flash    = get_flash_message(request)
     response = templates.TemplateResponse("home.html", {
-        "request":      request,
-        "logged_in":    get_current_user(request) is not None,
+        "request": request,
+        "logged_in": get_current_user(request) is not None,
         "flash_message": flash,
     })
     clear_flash_message(response)
@@ -421,10 +448,10 @@ async def home(request: Request):
 
 @app.get("/about", response_class=HTMLResponse)
 async def about(request: Request):
-    flash = get_flash_message(request)
+    flash    = get_flash_message(request)
     response = templates.TemplateResponse("about.html", {
-        "request":      request,
-        "logged_in":    get_current_user(request) is not None,
+        "request": request,
+        "logged_in": get_current_user(request) is not None,
         "flash_message": flash,
     })
     clear_flash_message(response)
@@ -433,10 +460,10 @@ async def about(request: Request):
 
 @app.get("/register_user", response_class=HTMLResponse)
 async def register_page(request: Request):
-    flash = get_flash_message(request)
+    flash    = get_flash_message(request)
     response = templates.TemplateResponse("register_user.html", {
-        "request":      request,
-        "logged_in":    get_current_user(request) is not None,
+        "request": request,
+        "logged_in": get_current_user(request) is not None,
         "flash_message": flash,
     })
     clear_flash_message(response)
@@ -448,14 +475,16 @@ async def register_user(
     username: str = Form(...),
     password: str = Form(...),
 ):
-    hashed = pwd_ctx.hash(password)   # bcrypt, not werkzeug
+    hashed = pwd_ctx.hash(password)
 
     def _insert():
-        with write_connection() as conn:
-            conn.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                (username, hashed),
-            )
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
+                    (username, hashed),
+                )
+            conn.commit()
 
     try:
         await run_db(_insert)
@@ -463,7 +492,7 @@ async def register_user(
         flash_message(resp, f"{username} registered successfully", "success")
         logger.info(f"User registered: {username}")
         return resp
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
         resp = RedirectResponse(url="/register_user", status_code=302)
         flash_message(resp, f"Username '{username}' is already taken", "danger")
         return resp
@@ -471,10 +500,10 @@ async def register_user(
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    flash = get_flash_message(request)
+    flash    = get_flash_message(request)
     response = templates.TemplateResponse("login.html", {
-        "request":      request,
-        "logged_in":    get_current_user(request) is not None,
+        "request": request,
+        "logged_in": get_current_user(request) is not None,
         "flash_message": flash,
     })
     clear_flash_message(response)
@@ -487,29 +516,50 @@ async def do_login(
     password: str = Form(...),
 ):
     def _fetch():
-        with read_connection() as conn:
-            return conn.execute(
-                "SELECT id, password_hash FROM users WHERE username=?",
-                (username,),
-            ).fetchone()
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, password_hash FROM users WHERE username = %s",
+                    (username,),
+                )
+                return cur.fetchone()
 
-    row = await run_db(_fetch)
-
-    # pwd_ctx.verify is CPU-bound (bcrypt) — offload it too
-    valid = await run_db(lambda: row is not None and pwd_ctx.verify(password, row[1]))
+    row   = await run_db(_fetch)
+    valid = await run_db(lambda: row is not None and pwd_ctx.verify(password, row["password_hash"]))
 
     if valid:
-        token = _sign_session(row[0])
-        resp  = RedirectResponse(url="/", status_code=302)
+        global _pipelines_booted
+        uid   = row["id"]
+        token = _sign_session(uid)
+
+        # Fetch this user's cameras then fire apply_changes as a background
+        # task so monitoring starts immediately without blocking the response.
+        def _fetch_cams():
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, stream_url FROM cameras WHERE user_id = %s",
+                        (uid,),
+                    )
+                    return [{"id": r["id"], "stream_url": r["stream_url"]}
+                            for r in cur.fetchall()]
+
+        user_cameras = await run_db(_fetch_cams)
+        _pipelines_booted = True  # prevent the auto-resume middleware from re-triggering
+        asyncio.create_task(apply_changes(user_cameras))
+        logger.info(
+            f"Login: {username} — pipeline startup triggered "
+            f"for {len(user_cameras)} camera(s)"
+        )
+
+        resp = RedirectResponse(url="/", status_code=302)
         resp.set_cookie(
-            SESSION_COOKIE,
-            token,
+            SESSION_COOKIE, token,
             max_age=SESSION_MAX_AGE,
-            httponly=True,    # JS cannot read this cookie
+            httponly=True,
             samesite="lax",
         )
         flash_message(resp, f"Welcome {username}", "success")
-        logger.info(f"Login: {username}")
         return resp
 
     resp = RedirectResponse(url="/login", status_code=302)
@@ -519,15 +569,20 @@ async def do_login(
 
 @app.get("/logout")
 async def logout():
+    global _pipelines_booted
+    _pipelines_booted = False
+    asyncio.create_task(apply_changes([]))  # empty list = teardown only, no startup
+    logger.info("Logout — pipeline teardown triggered")
+
     resp = RedirectResponse(url="/", status_code=302)
     resp.delete_cookie(SESSION_COOKIE)
     flash_message(resp, "Logged out", "success")
     return resp
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Camera management
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/register", response_class=HTMLResponse)
 async def camera_page(request: Request):
     uid = get_current_user(request)
@@ -537,19 +592,21 @@ async def camera_page(request: Request):
         return resp
 
     def _fetch():
-        with read_connection() as conn:
-            return conn.execute(
-                "SELECT id, name, stream_url FROM cameras WHERE user_id=?",
-                (uid,),
-            ).fetchall()
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, stream_url FROM cameras WHERE user_id = %s",
+                    (uid,),
+                )
+                return cur.fetchall()
 
     rows    = await run_db(_fetch)
-    cameras = [{"id": r[0], "name": r[1], "url": r[2]} for r in rows]
+    cameras = [{"id": r["id"], "name": r["name"], "url": r["stream_url"]} for r in rows]
     flash   = get_flash_message(request)
     resp    = templates.TemplateResponse("register.html", {
-        "request":      request,
-        "logged_in":    True,
-        "cameras":      cameras,
+        "request": request,
+        "logged_in": True,
+        "cameras": cameras,
         "flash_message": flash,
     })
     clear_flash_message(resp)
@@ -574,31 +631,23 @@ async def register_camera(
         return resp
 
     def _insert():
-        with write_connection() as conn:
-            cur = conn.execute(
-                "INSERT INTO cameras (name, stream_url, user_id) VALUES (?, ?, ?)",
-                (name.strip(), url.strip(), uid),
-            )
-            return cur.lastrowid
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO cameras (name, stream_url, user_id) VALUES (%s, %s, %s) RETURNING id",
+                    (name.strip(), url.strip(), uid),
+                )
+                cam_id = cur.fetchone()["id"]
+            conn.commit()
+            return cam_id
 
     cam_id = await run_db(_insert)
-
-    # Register pipeline + restart detector (Option A)
-    # This runs in the main thread — it's fast (queue creation, shm alloc)
-    try:
-        proc = create_pipeline(url.strip(), cam_id)
-        processors[cam_id] = proc
-        _restart_all_workers()()   # ← fresh detector snapshot with new camera
-        proc.start()
-        logger.info(f"Camera {cam_id} '{name.strip()}' added and pipeline started")
-    except Exception as e:
-        logger.error(f"Pipeline start failed for camera {cam_id}: {e}")
-        resp = RedirectResponse(url="/register", status_code=302)
-        flash_message(resp, f"Camera registered but pipeline failed: {e}", "danger")
-        return resp
+    global cameras_dirty
+    cameras_dirty = True
+    logger.info(f"Camera {cam_id} '{name.strip()}' added — changes staged")
 
     resp = RedirectResponse(url="/register", status_code=302)
-    flash_message(resp, f"Camera '{name.strip()}' registered and started.", "success")
+    flash_message(resp, f"Camera '{name.strip()}' added. Go to Monitor to activate.", "success")
     return resp
 
 
@@ -610,70 +659,50 @@ async def delete_camera(cam_id: int, request: Request):
         flash_message(resp, "You need to log in first.", "danger")
         return resp
 
-    # Stop the pipeline first
-    proc = processors.pop(cam_id, None)
-    if proc is not None:
-        try:
-            proc.stop()
-        except Exception as e:
-            logger.error(f"Error stopping pipeline for cam {cam_id}: {e}")
-
-    # Remove from global tracking dicts
-    det_queues.pop(cam_id, None)
-    free_slots_queues.pop(cam_id, None)
-    shm_names.pop(cam_id, None)
-
-    # Restart detector without this camera
-    if processors:
-        # _restart_all_workers()()
-        _restart_all_workers()
-    else:
-        _stop_batched_detector()
-        logger.info("No cameras remaining — batched detector stopped")
-
-    # Delete from DB
     def _delete():
+        # write_connection() commits on success, rolls back on exception.
+        # The old code used get_connection() which never commits in PostgreSQL —
+        # that is why the deleted camera always reappeared after restart.
         with write_connection() as conn:
-            cam = conn.execute(
-                "SELECT id FROM cameras WHERE id=? AND user_id=?",
-                (cam_id, uid),
-            ).fetchone()
-            if not cam:
-                return False
-            conn.execute("DELETE FROM detections WHERE camera_id=?", (cam_id,))
-            emb_ids = [
-                r[0] for r in conn.execute(
-                    "SELECT id FROM embedding_meta WHERE camera_id=?",
-                    (cam_id,),
-                ).fetchall()
-            ]
-            conn.execute("DELETE FROM embedding_meta WHERE camera_id=?", (cam_id,))
-            if emb_ids:
-                conn.execute(
-                    f"DELETE FROM embeddings WHERE rowid IN ({','.join('?'*len(emb_ids))})",
-                    emb_ids,
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cameras WHERE id = %s AND user_id = %s",
+                    (cam_id, uid),
                 )
-            conn.execute("DELETE FROM cameras WHERE id=? AND user_id=?", (cam_id, uid))
-            return True
+                if not cur.fetchone():
+                    return False
+                cur.execute("DELETE FROM detections WHERE camera_id = %s", (cam_id,))
+                cur.execute(
+                    "DELETE FROM cameras WHERE id = %s AND user_id = %s",
+                    (cam_id, uid),
+                )
+        return True
 
     try:
         deleted = await run_db(_delete)
-        if not deleted:
-            resp = RedirectResponse(url="/register", status_code=302)
-            flash_message(resp, "Camera not found or access denied.", "danger")
-            return resp
-        resp = RedirectResponse(url="/register", status_code=302)
-        flash_message(resp, f"Camera {cam_id} deleted.", "success")
-        return resp
     except Exception as e:
+        logger.error(f"Camera deletion failed: {e}")
         resp = RedirectResponse(url="/register", status_code=302)
         flash_message(resp, f"Deletion failed: {e}", "danger")
         return resp
 
+    if not deleted:
+        resp = RedirectResponse(url="/register", status_code=302)
+        flash_message(resp, "Camera not found or access denied.", "danger")
+        return resp
 
-# ---------------------------------------------------------------------------
+    global cameras_dirty
+    cameras_dirty = True
+    logger.info(f"Camera {cam_id} deleted — changes staged")
+
+    resp = RedirectResponse(url="/register", status_code=302)
+    flash_message(resp, f"Camera {cam_id} deleted. Go to Monitor to activate.", "success")
+    return resp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Video feed
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/video_feed/{cam_id}")
 async def video_feed(cam_id: int, request: Request):
     uid = get_current_user(request)
@@ -681,79 +710,50 @@ async def video_feed(cam_id: int, request: Request):
         return RedirectResponse(url="/", status_code=302)
 
     processor = processors.get(cam_id)
-
     if processor is None:
-        # Camera registered in DB but not running — start it
-        def _fetch():
-            with read_connection() as conn:
-                return conn.execute(
-                    "SELECT stream_url FROM cameras WHERE id=? AND user_id=?",
-                    (cam_id, uid),
-                ).fetchone()
-
-        row = await run_db(_fetch)
-        if not row:
-            raise HTTPException(status_code=404, detail="Camera not found")
-
-        stream_url = row[0]
-
-        # Only create if genuinely missing — race condition guard
-        if cam_id not in processors:
-            proc = create_pipeline(stream_url, cam_id)
-            processors[cam_id] = proc
-            _restart_all_workers()()   # ← Option A restart
-            proc.start()
-            logger.info(f"Late-start pipeline for camera {cam_id}")
-
-        processor = processors[cam_id]
+        # Pipelines start on login; /monitor triggers restart automatically when cameras_dirty.
+        raise HTTPException(
+            status_code=404,
+            detail="Pipeline not running — log in or navigate to /monitor.",
+        )
 
     async def generate():
-        # Display resolution — separate from inference resolution
-        # Change these to whatever your cameras' native resolution is
-        # or add DISPLAY_WIDTH/DISPLAY_HEIGHT to settings
-        display_w = settings.DISPLAY_WIDTH   # e.g. 1280
-        display_h = settings.DISPLAY_HEIGHT  # e.g. 720
+        last_buf:     bytes | None = None
+        interval = 1.0 / 30
 
         while True:
-            frame = processor.get_latest_frame()
-            if frame is not None:
-                # Upscale from inference resolution (512×512) to display resolution
-                if (frame.shape[1], frame.shape[0]) != (display_w, display_h):
-                    frame = cv2.resize(
-                        frame,
-                        (display_w, display_h),
-                        interpolation=cv2.INTER_LINEAR
-                    )
-                ret, buf = cv2.imencode(
-                    ".jpg", frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, 75]
+            if cam_id not in processors:
+                logger.debug(f"Camera {cam_id} — stream closed by apply_changes")
+                break
+
+            # has_frame.value is set to 1 by reader_worker the first time it
+            # successfully reads a frame from the camera. Until then, serve
+            # the offline image so the tile is never black or empty.
+            # After the camera connects, switch seamlessly to the live stream.
+            if not processor.has_frame.value:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + _OFFLINE_JPEG
+                    + b"\r\n"
                 )
-                if ret:
+                await asyncio.sleep(1.0)   # poll once per second while offline
+                continue
+
+            frame = processor.get_latest_frame()
+            ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ret:
+                frame_bytes = buf.tobytes()
+                if frame_bytes != last_buf:
+                    last_buf = frame_bytes
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n"
-                        + buf.tobytes()
+                        + frame_bytes
                         + b"\r\n"
                     )
-            await asyncio.sleep(0.033)
 
-    #### OPTION 2: Full Res Image through the Pipeline
-    # async def generate():
-    #     while True:
-    #         frame = processor.get_latest_frame()   # already native res
-    #         if frame is not None:
-    #             ret, buf = cv2.imencode(
-    #                 ".jpg", frame,
-    #                 [cv2.IMWRITE_JPEG_QUALITY, 75])
-    #             if ret:
-    #                 yield (
-    #                     b"--frame\r\n"
-    #                     b"Content-Type: image/jpeg\r\n\r\n"
-    #                     + buf.tobytes()
-    #                     + b"\r\n"
-    #                 )
-    #         await asyncio.sleep(0.033)
-
+            await asyncio.sleep(interval)
 
     return StreamingResponse(
         generate(),
@@ -761,9 +761,9 @@ async def video_feed(cam_id: int, request: Request):
     )
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Pages
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor(request: Request):
     uid = get_current_user(request)
@@ -772,19 +772,39 @@ async def monitor(request: Request):
         flash_message(resp, "You need to log in first.", "danger")
         return resp
 
-    def _fetch():
-        with read_connection() as conn:
-            return conn.execute(
-                "SELECT id, name, stream_url FROM cameras WHERE user_id=?",
-                (uid,),
-            ).fetchall()
+    global cameras_dirty
 
-    rows    = await run_db(_fetch)
-    cam_list = [{"id": r[0], "name": r[1], "path": r[2]} for r in rows]
+    def _fetch():
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, stream_url FROM cameras WHERE user_id = %s",
+                    (uid,),
+                )
+                return cur.fetchall()
+
+    rows = await run_db(_fetch)
+
+    if cameras_dirty:
+        # Camera list changed since last apply — restart pipelines automatically.
+        # Fire as background task so the page renders immediately with the
+        # spinner; pipelines come up while the user is already looking at monitor.
+        cameras_dirty    = False   # clear before the task starts — not after
+        user_cameras     = [{"id": r["id"], "stream_url": r["stream_url"]} for r in rows]
+        asyncio.create_task(apply_changes(user_cameras))
+        logger.info(f"Monitor: cameras_dirty — auto-restart triggered "
+                    f"for {len(user_cameras)} camera(s)")
+        pipelines_running = False   # show spinner while they boot
+    else:
+        pipelines_running = len(processors) > 0
+
+    cam_list = [{"id": r["id"], "name": r["name"], "path": r["stream_url"]} for r in rows]
+
     return templates.TemplateResponse("monitor.html", {
-        "request":   request,
-        "cameras":   cam_list,
+        "request": request,
+        "cameras": cam_list,
         "logged_in": True,
+        "pipelines_running": pipelines_running,
     })
 
 
@@ -792,99 +812,80 @@ async def monitor(request: Request):
 async def analysis(request: Request):
     flash = get_flash_message(request)
     resp  = templates.TemplateResponse("analysis.html", {
-        "request":      request,
-        "logged_in":    get_current_user(request) is not None,
+        "request": request,
+        "logged_in": get_current_user(request) is not None,
         "flash_message": flash,
     })
     clear_flash_message(resp)
     return resp
 
 
-# ---------------------------------------------------------------------------
-# JSON API  (the commented schema you had — now real)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON API
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/api/state")
 async def api_state(request: Request):
-    """
-    Live system state for the frontend dashboard.
-    Returns cameras, recent customers, detections, and alerts.
-    """
     uid = get_current_user(request)
     if uid is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     def _fetch():
-        with read_connection() as conn:
-            cameras = conn.execute(
-                "SELECT id, name, stream_url FROM cameras WHERE user_id=?",
-                (uid,),
-            ).fetchall()
-
-            customers = conn.execute(
-                """
-                SELECT id, first_seen, last_seen
-                FROM customers
-                ORDER BY last_seen DESC
-                LIMIT 50
-                """,
-            ).fetchall()
-
-            detections = conn.execute(
-                """
-                SELECT d.id, d.camera_id, d.timestamp, d.bbox,
-                       em.customer_id
-                FROM detections d
-                JOIN embedding_meta em ON em.id = d.embedding_meta_id
-                WHERE d.camera_id IN (
-                    SELECT id FROM cameras WHERE user_id=?
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, stream_url FROM cameras WHERE user_id = %s",
+                    (uid,),
                 )
-                ORDER BY d.timestamp DESC
-                LIMIT 100
-                """,
-                (uid,),
-            ).fetchall()
+                cameras = cur.fetchall()
 
-        return cameras, customers, detections
+                cur.execute("""
+                    SELECT id, first_seen, last_seen
+                    FROM customers
+                    ORDER BY last_seen DESC
+                    LIMIT 50
+                """)
+                customers = cur.fetchall()
+
+                cur.execute("""
+                    SELECT d.id, d.camera_id, d.timestamp, d.bbox,
+                           e.customer_id
+                    FROM detections d
+                    LEFT JOIN embeddings e ON e.id = d.embedding_id
+                    WHERE d.camera_id IN (
+                        SELECT id FROM cameras WHERE user_id = %s
+                    )
+                    ORDER BY d.timestamp DESC
+                    LIMIT 100
+                """, (uid,))
+                detections = cur.fetchall()
+
+            return cameras, customers, detections
 
     cameras_rows, customer_rows, detection_rows = await run_db(_fetch)
 
-    # Enrich cameras with live pipeline status
     cam_list = []
     for r in cameras_rows:
-        proc   = processors.get(r[0])
+        proc   = processors.get(r["id"])
         status = "online" if (proc and proc.is_alive()) else "offline"
         cam_list.append({
-            "id":        r[0],
-            "name":      r[1],
-            "streamUrl": r[2],
-            "status":    status,
+            "id": r["id"], "name": r["name"], "streamUrl": r["stream_url"], "status": status,
         })
 
-    cust_list = [{
-        "id":        r[0],
-        "firstSeen": r[1],
-        "lastSeen":  r[2],
-    } for r in customer_rows]
-
-    det_list = [{
-        "id":         r[0],
-        "cameraId":   r[1],
-        "timestamp":  r[2],
-        "bbox":       json.loads(r[3]) if r[3] else None,
-        "customerId": r[4],
-    } for r in detection_rows]
-
     return {
-        "cameras":    cam_list,
-        "customers":  cust_list,
-        "detections": det_list,
-        "alerts":     [],   # wire loitering alerts here when ready
+        "cameras": cam_list,
+        "customers": [{"id": r["id"], "firstSeen": r["first_seen"], "lastSeen": r["last_seen"]}
+                      for r in customer_rows],
+        "detections": [{
+            "id": r["id"], "cameraId": r["camera_id"], "timestamp": r["timestamp"],
+            "bbox": json.loads(r["bbox"]) if r["bbox"] else None,
+            "customerId": r["customer_id"],
+        } for r in detection_rows],
+        "alerts": [],
     }
 
 
 @app.get("/api/cameras/{cam_id}/status")
 async def camera_status(cam_id: int, request: Request):
-    """Quick health check for a single camera pipeline."""
     uid = get_current_user(request)
     if uid is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -897,14 +898,14 @@ async def camera_status(cam_id: int, request: Request):
     }
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        workers=1,           # MUST be 1 — multiprocessing state is not fork-safe
-        reload=False,        # MUST be False in production — reloader kills child procs
+        workers=1,      # MUST be 1 — multiprocessing state is not fork-safe
+        reload=False,   # MUST be False — reloader kills child processes
     )

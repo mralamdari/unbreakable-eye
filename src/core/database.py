@@ -37,6 +37,37 @@ import psycopg2.pool
 import psycopg2.extras
 from loguru import logger
 
+# pgvector type adapter for psycopg2 ─────────────────────────────────────────
+# Without this, psycopg2 returns vector columns as raw strings like
+# '[0.1,0.2,...]' instead of Python lists, causing the ValueError in load_cache.
+# We register a lightweight string-parser rather than pulling in the pgvector
+# Python package, so there is no extra dependency.
+def _parse_vector(s, cur=None):   # cur is passed by psycopg2 but unused
+    """Convert a pgvector string '[x,y,...]' to a Python list of floats."""
+    if s is None:
+        return None
+    return [float(v) for v in s.strip("[]").split(",")]
+
+def _register_vector_type(conn) -> None:
+    """
+    Register the pgvector OID and type adapter on *conn* so that every
+    SELECT returns Python lists instead of raw strings.
+
+    Called once per new connection, right after getconn().
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT oid FROM pg_type WHERE typname = 'vector'")
+        row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(
+            "pgvector extension not found — run 'CREATE EXTENSION vector' first."
+        )
+    oid = row[0] if isinstance(row, (list, tuple)) else row["oid"]
+    vector_type = psycopg2.extensions.new_type(
+        (oid,), "VECTOR", _parse_vector
+    )
+    psycopg2.extensions.register_type(vector_type, conn)
+
 from src.core.config import settings
 from src.core.exceptions import DatabaseError
 
@@ -117,6 +148,7 @@ def get_connection():
     pool = _get_pool()
     conn = pool.getconn()
     conn.cursor_factory = psycopg2.extras.RealDictCursor
+    _register_vector_type(conn)
     try:
         yield conn
     finally:
@@ -137,7 +169,6 @@ def write_connection():
         except Exception:
             conn.rollback()
             raise
-
 
 @contextmanager
 def read_connection():
@@ -634,4 +665,4 @@ def min_distance_to_customer(
             (emb_list, customer_id),
         )
         row = cur.fetchone()
-    return float(row["min_dist"]) if row and row["min_dist"] is not None else float("inf")
+    return float(row["min_dist"]) if row and row["min_dist"] is not None else float("inf")    

@@ -60,16 +60,20 @@ def get_detector() -> BaseDetector:
             class_agnostic=settings.CLASS_AGNOSTIC,
         )
 
-    elif arch in (ModelType.RFDETR, ModelType.DFINE):
-        _INPUT_DIM = (544, 544)
-        _MODEL_NAME = 'rfdetr'
-        if 'dfine' in model_path:
-            _MODEL_NAME = 'dfine'
-            _INPUT_DIM = (640, 640)
+    elif arch == ModelType.DFINE:
         return HFTransformerDetector(
             model_path=model_path,
-            model_name=_MODEL_NAME,
-            input_dim=_INPUT_DIM,
+            model_name='dfine',
+            input_dim=(640, 640),
+            conf_thresh=conf,
+            device=device,
+        )
+
+    elif arch == ModelType.RFDETR:
+        return HFTransformerDetector(
+            model_path=model_path,
+            model_name='rfdetr',
+            input_dim=(640, 640),
             conf_thresh=conf,
             device=device,
         )

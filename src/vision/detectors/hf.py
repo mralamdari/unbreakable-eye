@@ -40,6 +40,8 @@ class HFTransformerDetector(BaseDetector):
     def __init__(
         self,
         model_path: str,
+        model_name: str,
+        input_dim: tuple[int, int],
         conf_thresh: float = 0.4,
         device: str = "cpu",
     ):
@@ -54,8 +56,9 @@ class HFTransformerDetector(BaseDetector):
             ModelLoadError: If the ONNX session cannot be created or the
                              graph shape/output count is unexpected.
         """
-        self.confidence_thres = conf_thresh
         self.device = device.lower()
+        self.model_name = model_name
+        self.confidence_thres = conf_thresh
 
         try:
             num_threads = max(1, (os.cpu_count() or 4) // 2 - 1)
@@ -77,7 +80,8 @@ class HFTransformerDetector(BaseDetector):
             # Read input (H, W) from the ONNX graph — never hardcode.
             # onnxruntime reports dynamic/symbolic dims as strings (e.g.
             # "height") rather than ints — detect and fall back safely.
-            self.input_h, self.input_w = settings.HF_INPUT_SIZE, settings.HF_INPUT_SIZE
+            self.input_h, self.input_w = input_dim[0], input_dim[1]
+            # self.input_h, self.input_w = settings.HF_INPUT_SIZE, settings.HF_INPUT_SIZE
 
             logger.info(
                 f"Transformer ready | input={self.input_h}×{self.input_w} "
@@ -124,6 +128,11 @@ class HFTransformerDetector(BaseDetector):
 
             # Rescale by 1/255 ONLY — do_normalize=false means NO mean/std.
             img = img.astype(np.float32) / 255.0
+            if self.model_name == 'rfdetr':
+                _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+                _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+                img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
+                        
 
             # HWC → NCHW, add batch dim
             img = np.transpose(img, (2, 0, 1))[np.newaxis]

@@ -4,12 +4,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 1. Enums: Provide strict types for model architecture and device
 class ModelType(str, Enum):
-    YOLOX = "yolox"
-    DFINE = "onnx-community"
-    RFDETR = "onnx-community"
+    YOLOX       = "yolox"
+    DFINE       = "dfine"        # type-safe discriminator — HF repo stays in HF_MODEL_REPONAME
+    RFDETR      = "rfdetr"       # type-safe discriminator — HF repo stays in HF_MODEL_REPONAME
     ULTRALYTICS = "ultralytics"
-    OPENVINO = "openvino"
-    YOLO_ONNX = "yolo_onnx"
+    OPENVINO    = "openvino"
+    YOLO_ONNX   = "yolo_onnx"
     
 
 class Device(str, Enum):

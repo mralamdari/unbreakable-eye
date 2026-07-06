@@ -81,23 +81,33 @@ def model_id_provider(
     """
     Resolve (MODEL_ID, MODEL_ARCH) into a relative model path and concrete arch.
 
-    Handles four .env patterns users actually write:
-      1. MODEL_ARCH only          → "<arch>/<default_file>"
-      2. MODEL_ID=<filename>      → "<arch>/<filename>"  (MODEL_ARCH required)
-      3. MODEL_ID=<arch>          → "<arch>/<default_file>"
-      4. MODEL_ID=<arch>/<file>   → "<arch>/<file>"
+    For HF-hosted architectures (DFINE, RFDETR) the local folder prefix is
+    HF_MODEL_REPONAME (e.g. "onnx-community") to match the on-disk layout:
+        models/onnx-community/rfdetr_nano-ONNX/onnx/model_quantized.onnx
 
-    Args:
-        model_id:   Raw MODEL_ID string from settings (may be empty/None).
-        model_arch: MODEL_ARCH enum from settings (may be None).
+    For all other architectures the folder prefix is the arch value itself:
+        models/ultralytics/yolov8n.pt
+
+    Handles four .env patterns users actually write:
+      1. MODEL_ARCH only          → "<prefix>/<default_file>"
+      2. MODEL_ID=<filename>      → "<prefix>/<filename>"  (MODEL_ARCH required)
+      3. MODEL_ID=<arch>          → "<prefix>/<default_file>"
+      4. MODEL_ID=<arch>/<file>   → "<prefix>/<file>"
 
     Returns:
         (relative_path, resolved_arch)
-        e.g. ("ultralytics/yolov8n.pt", ModelType.ULTRALYTICS)
+        e.g. ("onnx-community/rfdetr_nano-ONNX", ModelType.RFDETR)
+             ("ultralytics/yolov8n.pt",           ModelType.ULTRALYTICS)
 
     Raises:
         ModelConfigError: If the combination is ambiguous or invalid.
     """
+    _HF_ARCHS = {ModelType.DFINE, ModelType.RFDETR}
+
+    def _folder_prefix(arch: ModelType) -> str:
+        """Local folder prefix — HF archs use HF_MODEL_REPONAME, others use arch value."""
+        return settings.HF_MODEL_REPONAME if arch in _HF_ARCHS else arch.value
+
     mid           = (model_id or "").strip()
     valid_arch_values = {m.value: m for m in ModelType}
 
@@ -108,33 +118,48 @@ def model_id_provider(
                 "Both MODEL_ID and MODEL_ARCH are unset. "
                 "Set at least MODEL_ARCH in .env (e.g. MODEL_ARCH=yolo_onnx)."
             )
-        return f"{model_arch.value}/{_default_filename(model_arch)}", model_arch
+        prefix = _folder_prefix(model_arch)
+        return f"{prefix}/{_default_filename(model_arch)}", model_arch
 
     # ── Case 2 / 3: No slash — bare filename or bare arch name ───────────────
     if "/" not in mid:
         if mid in valid_arch_values:
-            # MODEL_ID="ultralytics" — treat as arch selector
-            arch = model_arch or valid_arch_values[mid]
-            return f"{arch.value}/{_default_filename(arch)}", arch
+            # MODEL_ID="rfdetr" — treat as arch selector
+            arch   = model_arch or valid_arch_values[mid]
+            prefix = _folder_prefix(arch)
+            return f"{prefix}/{_default_filename(arch)}", arch
 
-        # MODEL_ID="yolov8n.pt" — bare filename, MODEL_ARCH must be set
+        # MODEL_ID="rfdetr_nano-ONNX" — bare model name, MODEL_ARCH must be set
         if model_arch is None:
             raise ModelConfigError(
                 f"MODEL_ID='{mid}' looks like a filename but MODEL_ARCH is not set. "
                 f"Either add MODEL_ARCH=<arch> or use MODEL_ID=<arch>/{mid}.",
                 context={"model_id": mid},
             )
-        return f"{model_arch.value}/{mid}", model_arch
+        prefix = _folder_prefix(model_arch)
+        return f"{prefix}/{mid}", model_arch
 
     # ── Case 4: Contains slash — "folder/filename" ────────────────────────────
     folder, filename = mid.rsplit("/", 1)
 
     if model_arch is not None:
-        # Explicit MODEL_ARCH always wins over the folder in MODEL_ID
-        return f"{model_arch.value}/{filename}", model_arch
+        # Explicit MODEL_ARCH always wins — rewrite folder to correct prefix
+        prefix = _folder_prefix(model_arch)
+        return f"{prefix}/{filename}", model_arch
 
     if folder in valid_arch_values:
-        return mid, valid_arch_values[folder]
+        arch   = valid_arch_values[folder]
+        prefix = _folder_prefix(arch)
+        return f"{prefix}/{filename}", arch
+
+    # folder might already be the HF namespace (e.g. "onnx-community")
+    if folder == settings.HF_MODEL_REPONAME:
+        # Can't determine arch from HF namespace alone — MODEL_ARCH required
+        raise ModelConfigError(
+            f"MODEL_ID='{mid}' uses the HF namespace as folder but MODEL_ARCH is not set. "
+            f"Add MODEL_ARCH=dfine or MODEL_ARCH=rfdetr to .env.",
+            context={"model_id": mid},
+        )
 
     raise ModelConfigError(
         f"MODEL_ID='{mid}' has unknown folder '{folder}' and MODEL_ARCH is not set. "
@@ -484,13 +509,18 @@ def resolve_model_path() -> str:
         return _download_yolox_github(yolox_url, model_file)
 
     elif model_arch in (ModelType.DFINE, ModelType.RFDETR):
+        # relative_path is e.g. "onnx-community/rfdetr_nano-ONNX"
+        # The HF repo_id is exactly that: "onnx-community/rfdetr_nano-ONNX"
+        # (HF_MODEL_REPONAME / model_name) — already correct because
+        # model_id_provider now uses HF_MODEL_REPONAME as the folder prefix.
+        hf_repo_id   = relative_path          # "onnx-community/rfdetr_nano-ONNX"
         hf_local_dir = os.path.join(models_root, relative_path)
         os.makedirs(
             os.path.join(hf_local_dir, hf_filename.split("/")[0]),
             exist_ok=True
         )
         return _download_from_hf(
-            repo_id=relative_path,
+            repo_id=hf_repo_id,
             hf_filename=hf_filename,
             final_path=hf_model_file,
             local_dir=hf_local_dir,

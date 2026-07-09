@@ -36,7 +36,7 @@ from src.core.config import settings
 from src.core.logging import setup_logging
 from src.core.db_writer import start_db_writer
 from src.core.database import init_db, load_cache, get_connection, write_connection
-from src.engine.pipeline import VisionPipeline, batched_detector_worker
+from src.engine.pipeline import VisionPipeline, batched_detector_worker, shared_embedder_worker
 
 
 # ─────────────────────────────────────────────────────────────────────────────

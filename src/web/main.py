@@ -13,11 +13,9 @@ All blocking DB calls are offloaded via run_db() to avoid blocking the event loo
 
 import os
 import cv2
-import time
 import json
 import asyncio
 import uvicorn
-import numpy as np
 from loguru import logger
 import multiprocessing as mp
 from contextlib import asynccontextmanager
@@ -29,10 +27,10 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from passlib.context import CryptContext
 
 from fastapi import FastAPI, HTTPException, Request, Form, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.requests import Request
 
 from src.core.config import settings
 from src.core.logging import setup_logging
@@ -129,6 +127,8 @@ db_writer_proc    = None
 global_stop_event = None  # signals batched_detector + final app shutdown only
 cameras_dirty     = False  # True when DB camera list changed since last apply
 _pipelines_booted = False  # set True once apply_changes has run since process start
+analytics_queue       = None
+analytics_writer_proc = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,6 +183,7 @@ def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
         db_queue=db_queue,
         response_queue=response_queue,
         frame_ready_queue=frame_ready_queue,
+        analytics_queue=analytics_queue,
     )
     shm_names[cam_id] = processor.input_shm_name
     return processor
@@ -340,6 +341,7 @@ async def lifespan(app: FastAPI):
     global_stop_event = CTX.Event()
     db_queue          = CTX.Queue(maxsize=1024)
     frame_ready_queue = CTX.Queue(maxsize=64)
+    analytics_queue   = CTX.Queue(maxsize=2048)
 
     init_db()
 
@@ -349,6 +351,10 @@ async def lifespan(app: FastAPI):
     # db_writer starts at app boot — owns the embedding cache.
     # Pipelines start on first login via apply_changes().
     db_writer_proc = start_db_writer(CTX, db_queue, response_queues)
+
+    # Analytics writer — batches detection events, runs retention cleanup
+    from src.core.analytics_writer import start_analytics_writer
+    analytics_writer_proc = start_analytics_writer(CTX, analytics_queue)
 
     logger.info("App ready — pipelines will start automatically on login")
 
@@ -373,6 +379,12 @@ async def lifespan(app: FastAPI):
             db_writer_proc.join(timeout=5)
         except Exception:
             pass
+    if analytics_writer_proc is not None:             # 4. analytics writer
+        try:
+            analytics_queue.put("SHUTDOWN", timeout=2)
+            analytics_writer_proc.join(timeout=5)
+        except Exception:
+            pass
 
     logger.info("Shutdown complete")
 
@@ -385,6 +397,26 @@ BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app       = FastAPI(lifespan=lifespan, title="ShopVision API", version="2.0.0")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "web", "templates"))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "web", "static")), name="static")
+
+# CORS — restrict origins in production via CORS_ORIGINS env var
+_cors_origins = os.environ.get("CORS_ORIGINS", "").split(",")
+_cors_origins = [o.strip() for o in _cors_origins if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Health check
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok", "cameras": len(processors)}
 
 # Load offline image once — served by generate() until has_frame.value is set.
 _offline_path = os.path.join(BASE_DIR, "web", "static", "camera_offline.jpg")
@@ -403,30 +435,38 @@ async def auto_resume_on_restart(request: Request, call_next):
     This runs once: the first incoming request after boot that carries a
     valid session triggers apply_changes() in the background, exactly like
     do_login() does. Every later request is a no-op pass-through.
+
+    The response is returned IMMEDIATELY — the DB fetch and pipeline startup
+    happen in a background task so the user never sees a frozen page.
     """
     global _pipelines_booted
 
     if not _pipelines_booted:
         uid = get_current_user(request)
         if uid is not None:
-            _pipelines_booted = True  # set before await — never trigger twice
+            _pipelines_booted = True  # set before spawn — never trigger twice
 
-            def _fetch_cams():
-                with get_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT id, stream_url FROM cameras WHERE user_id = %s",
-                            (uid,),
-                        )
-                        return [{"id": r["id"], "stream_url": r["stream_url"]}
-                                for r in cur.fetchall()]
+            async def _background_resume(user_id: int):
+                try:
+                    def _fetch_cams():
+                        with get_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT id, stream_url FROM cameras WHERE user_id = %s",
+                                    (user_id,),
+                                )
+                                return [{"id": r["id"], "stream_url": r["stream_url"]}
+                                        for r in cur.fetchall()]
 
-            user_cameras = await run_db(_fetch_cams)
-            asyncio.create_task(apply_changes(user_cameras))
-            logger.info(
-                f"Resumed session detected (uid={uid}) — pipeline startup "
-                f"triggered for {len(user_cameras)} camera(s), no re-login needed"
-            )
+                    user_cameras = await run_db(_fetch_cams)
+                    await apply_changes(user_cameras)
+                    logger.info(
+                        f"Resumed session (uid={user_id}) — {len(user_cameras)} camera(s) live"
+                    )
+                except Exception as e:
+                    logger.error(f"Auto-resume failed: {e}")
+
+            asyncio.create_task(_background_resume(uid))
 
     return await call_next(request)
 
@@ -558,6 +598,7 @@ async def do_login(
             max_age=SESSION_MAX_AGE,
             httponly=True,
             samesite="lax",
+            secure=os.environ.get("SECURE_COOKIES", "false").lower() == "true",
         )
         flash_message(resp, f"Welcome {username}", "success")
         return resp
@@ -709,51 +750,59 @@ async def video_feed(cam_id: int, request: Request):
     if uid is None:
         return RedirectResponse(url="/", status_code=302)
 
-    processor = processors.get(cam_id)
-    if processor is None:
-        # Pipelines start on login; /monitor triggers restart automatically when cameras_dirty.
-        raise HTTPException(
-            status_code=404,
-            detail="Pipeline not running — log in or navigate to /monitor.",
-        )
-
     async def generate():
         last_buf:     bytes | None = None
         interval = 1.0 / 30
+        processor = None
 
-        while True:
-            if cam_id not in processors:
-                logger.debug(f"Camera {cam_id} — stream closed by apply_changes")
-                break
+        try:
+            while True:
+                # Re-fetch processor each iteration so we pick up pipelines
+                # that start after the initial request (background resume).
+                processor = processors.get(cam_id)
 
-            # has_frame.value is set to 1 by reader_worker the first time it
-            # successfully reads a frame from the camera. Until then, serve
-            # the offline image so the tile is never black or empty.
-            # After the camera connects, switch seamlessly to the live stream.
-            if not processor.has_frame.value:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + _OFFLINE_JPEG
-                    + b"\r\n"
-                )
-                await asyncio.sleep(1.0)   # poll once per second while offline
-                continue
-
-            frame = processor.get_latest_frame()
-            ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if ret:
-                frame_bytes = buf.tobytes()
-                if frame_bytes != last_buf:
-                    last_buf = frame_bytes
+                if processor is None:
+                    # Pipeline not started yet — serve offline image so the
+                    # <img> tag gets a valid MJPEG frame instead of a 404.
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n"
-                        + frame_bytes
+                        + _OFFLINE_JPEG
                         + b"\r\n"
                     )
+                    await asyncio.sleep(1.0)
+                    continue
 
-            await asyncio.sleep(interval)
+                # has_frame.value is set to 1 by reader_worker the first time it
+                # successfully reads a frame from the camera. Until then, serve
+                # the offline image so the tile is never black or empty.
+                # After the camera connects, switch seamlessly to the live stream.
+                if not processor.has_frame.value:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + _OFFLINE_JPEG
+                        + b"\r\n"
+                    )
+                    await asyncio.sleep(1.0)   # poll once per second while offline
+                    continue
+
+                frame = processor.get_latest_frame()
+                ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ret:
+                    frame_bytes = buf.tobytes()
+                    if frame_bytes != last_buf:
+                        last_buf = frame_bytes
+                        yield (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n\r\n"
+                            + frame_bytes
+                            + b"\r\n"
+                        )
+
+                await asyncio.sleep(interval)
+        except Exception as e:
+            logger.error(f"Video feed error cam {cam_id}: {e}")
 
     return StreamingResponse(
         generate(),
@@ -805,7 +854,7 @@ async def monitor(request: Request):
         "cameras": cam_list,
         "logged_in": True,
         "pipelines_running": pipelines_running,
-    })
+    }, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/analysis", response_class=HTMLResponse)
@@ -866,7 +915,8 @@ async def api_state(request: Request):
     cam_list = []
     for r in cameras_rows:
         proc   = processors.get(r["id"])
-        status = "online" if (proc and proc.is_alive()) else "offline"
+        alive = proc is not None and getattr(getattr(proc, "p_reader", None), "is_alive", lambda: False)()
+        status = "online" if alive else "offline"
         cam_list.append({
             "id": r["id"], "name": r["name"], "streamUrl": r["stream_url"], "status": status,
         })
@@ -891,11 +941,295 @@ async def camera_status(cam_id: int, request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     proc = processors.get(cam_id)
+    alive = proc is not None and getattr(getattr(proc, "p_reader", None), "is_alive", lambda: False)()
     return {
         "cam_id":  cam_id,
-        "running": proc is not None and proc.is_alive(),
+        "running": alive,
         "pid":     proc.p_reader.pid if proc and hasattr(proc, "p_reader") else None,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics API
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/analysis/overview")
+async def analysis_overview(request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS cnt FROM customers")
+                total_customers = cur.fetchone()["cnt"]
+
+                cur.execute("SELECT COUNT(*) AS cnt FROM detections")
+                total_detections = cur.fetchone()["cnt"]
+
+                # Active now = distinct tracker_ids seen in last 5 minutes
+                import time
+                cutoff = time.time() - 300
+                cur.execute(
+                    "SELECT COUNT(DISTINCT tracker_id) AS cnt FROM detection_events WHERE timestamp > %s",
+                    (cutoff,),
+                )
+                active_now = cur.fetchone()["cnt"]
+
+            return {
+                "total_customers": total_customers,
+                "total_detections": total_detections,
+                "active_now": active_now,
+            }
+
+    return await run_db(_fetch)
+
+
+@app.get("/api/analysis/footfall")
+async def analysis_footfall(request: Request, interval: str = "hour", days: int = 7):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        with get_connection() as conn:
+            # Get first camera for the user
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cameras WHERE user_id = %s LIMIT 1",
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return []
+                cam_id = row["id"]
+
+            from src.core.database import get_footfall
+            return get_footfall(conn, cam_id, interval, days)
+
+    data = await run_db(_fetch)
+    return [
+        {"bucket": r["hour_bucket"], "visitors": r["unique_visitors"], "detections": r["total_detections"]}
+        for r in data
+    ]
+
+
+@app.get("/api/analysis/occupancy")
+async def analysis_occupancy(request: Request, hours: int = 24):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        import time
+        cutoff = time.time() - hours * 3600
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cameras WHERE user_id = %s LIMIT 1",
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return []
+                cam_id = row["id"]
+
+                cur.execute(
+                    """SELECT hour_bucket, peak_occupancy
+                       FROM analytics_hourly
+                       WHERE camera_id = %s AND hour_bucket > %s
+                       ORDER BY hour_bucket""",
+                    (cam_id, cutoff),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    data = await run_db(_fetch)
+    return [{"time": r["hour_bucket"], "occupancy": r["peak_occupancy"]} for r in data]
+
+
+@app.get("/api/analysis/dwell")
+async def analysis_dwell(request: Request, zone_id: int = None):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cameras WHERE user_id = %s LIMIT 1",
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {}
+                cam_id = row["id"]
+
+                if zone_id:
+                    cur.execute(
+                        """SELECT dwell_seconds FROM zone_events
+                           WHERE zone_id = %s AND event_type = 'exit' AND dwell_seconds > 0""",
+                        (zone_id,),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT ze.dwell_seconds FROM zone_events ze
+                           JOIN zones z ON z.id = ze.zone_id
+                           WHERE z.camera_id = %s AND ze.event_type = 'exit' AND ze.dwell_seconds > 0""",
+                        (cam_id,),
+                    )
+                rows = cur.fetchall()
+
+        # Build histogram buckets
+        if not rows:
+            return {}
+        buckets = {"0-10s": 0, "10-30s": 0, "30-60s": 0, "1-3min": 0, "3-10min": 0, "10min+": 0}
+        for r in rows:
+            d = r["dwell_seconds"]
+            if d < 10: buckets["0-10s"] += 1
+            elif d < 30: buckets["10-30s"] += 1
+            elif d < 60: buckets["30-60s"] += 1
+            elif d < 180: buckets["1-3min"] += 1
+            elif d < 600: buckets["3-10min"] += 1
+            else: buckets["10min+"] += 1
+        return buckets
+
+    return await run_db(_fetch)
+
+
+@app.get("/api/analysis/peak-hours")
+async def analysis_peak_hours(request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cameras WHERE user_id = %s LIMIT 1",
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return []
+                cam_id = row["id"]
+
+            from src.core.database import get_peak_hours
+            return get_peak_hours(conn, cam_id)
+
+    data = await run_db(_fetch)
+    return [{"dow": int(r["dow"]), "hour": int(r["hour"]), "total": r["total"]} for r in data]
+
+
+@app.get("/api/analysis/repeat-visitors")
+async def analysis_repeat_visitors(request: Request, days: int = 30):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM cameras WHERE user_id = %s LIMIT 1",
+                    (uid,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"new_visitors": 0, "return_visitors": 0}
+                cam_id = row["id"]
+
+            from src.core.database import get_repeat_visitors
+            return get_repeat_visitors(conn, cam_id, days)
+
+    return await run_db(_fetch)
+
+
+@app.get("/api/analysis/zone-stats")
+async def analysis_zone_stats(request: Request, cam_id: int = None):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        with get_connection() as conn:
+            if cam_id is None:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM cameras WHERE user_id = %s LIMIT 1",
+                        (uid,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return []
+                    target_cam = row["id"]
+            else:
+                target_cam = cam_id
+
+            from src.core.database import get_zone_stats
+            return get_zone_stats(conn, target_cam)
+
+    return await run_db(_fetch)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zone management API
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/zones/{cam_id}")
+async def list_zones(cam_id: int, request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _fetch():
+        from src.core.database import get_zones_for_camera
+        with get_connection() as conn:
+            return get_zones_for_camera(conn, cam_id)
+
+    zones = await run_db(_fetch)
+    return {"zones": zones}
+
+
+@app.post("/api/zones/{cam_id}")
+async def create_zone_endpoint(cam_id: int, request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    body = await request.json()
+    name = body.get("name", "Zone")
+    polygon = body.get("polygon")  # [[x1,y1],[x2,y2],...]
+    zone_type = body.get("zone_type", "area")
+    color = body.get("color", "#4f8cff")
+
+    if not polygon or len(polygon) < 3:
+        raise HTTPException(status_code=400, detail="Polygon must have at least 3 points")
+
+    def _insert():
+        from src.core.database import create_zone
+        with write_connection() as conn:
+            return create_zone(conn, cam_id, name, polygon, zone_type, color)
+
+    zone_id = await run_db(_insert)
+    return {"id": zone_id, "name": name, "zone_type": zone_type}
+
+
+@app.delete("/api/zones/{zone_id}")
+async def delete_zone_endpoint(zone_id: int, request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _delete():
+        from src.core.database import delete_zone
+        with write_connection() as conn:
+            return delete_zone(conn, zone_id)
+
+    deleted = await run_db(_delete)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    return {"deleted": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

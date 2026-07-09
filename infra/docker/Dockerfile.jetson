@@ -1,0 +1,45 @@
+# Dockerfile.jetson — NVIDIA Jetson (Orin/Xavier/Nano)
+# Uses L4T PyTorch base with CUDA support
+#
+# Build:
+#   docker build -f infra/docker/Dockerfile.jetson -t unbreakable-eye:jetson .
+#
+# Run:
+#   docker run --runtime nvidia -p 8000:8000 --env-file .env unbreakable-eye:jetson
+
+FROM nvcr.io/nvidia/l4t-pytorch:r35.2.1-pth2.0-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# System dependencies for OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir onnxruntime-gpu==1.16.3
+
+# Copy application code
+COPY src/ ./src/
+# Models are gitignored and large — mount at runtime via docker-compose volumes
+RUN mkdir -p /app/models
+
+# Create non-root user
+RUN useradd -m appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Edge-optimized defaults
+ENV WORKING_WIDTH=320
+ENV WORKING_HEIGHT=320
+ENV DEVICE=cuda
+
+EXPOSE 8000
+
+CMD ["uvicorn", "src.web.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # --- INPUT ---
     RTSP_URL: str = "0" # "0" for webcam, or actual RTSP link
 
-    SECRET_KEY: str = "change-me-to-a-random-64-char-string"
+    SECRET_KEY: str = ""  # Must be set in .env — no default for security
 
     WORKING_HEIGHT: int = 512
     WORKING_WIDTH:  int = 512
@@ -113,6 +113,27 @@ class Settings(BaseSettings):
     NMS_THRESHOLD: float = 0.4  #0.5  YOLO’s NMS is too aggressive. The box that remains after NMS covers both people, so the second never gets its own ID.
     
     CLASS_AGNOSTIC: bool = True # YOLOX specific
+
+    # --- PRIVACY ---
+    PRIVACY_BLUR: bool = False
+    PRIVACY_BLUR_KERNEL: int = 51
+
+    # --- HEATMAP ---
+    HEATMAP_ENABLED: bool = True
+    HEATMAP_RETENTION_SECONDS: int = 3600
+    HEATMAP_OPACITY: float = 0.25
+    HEATMAP_RADIUS: int = 40
+    HEATMAP_DECAY_RATE: float = 0.95
+
+    # --- ANALYTICS RETENTION ---
+    RAW_RETENTION_DAYS: int = 7
+    AGGREGATE_RETENTION_DAYS: int = 30
+    ANALYTICS_BATCH_SIZE: int = 100
+    ANALYTICS_FLUSH_INTERVAL: float = 5.0
+
+    # --- ZONES ---
+    DEFAULT_ZONE_NAME: str = "Full Frame"
+
     # --- WEB ---
     HOST: str = "0.0.0.0"
     PORT: int = 8000

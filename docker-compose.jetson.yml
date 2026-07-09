@@ -1,0 +1,25 @@
+# docker-compose.jetson.yml — NVIDIA Jetson overlay
+# Usage: docker compose -f docker-compose.yml -f docker-compose.jetson.yml up
+#
+# Requires: nvidia-container-toolkit installed on Jetson
+# Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.jetson
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          cpus: "4.0"
+          memory: 4G
+    environment:
+      - DEVICE=cuda
+      - WORKING_WIDTH=320
+      - WORKING_HEIGHT=320

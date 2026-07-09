@@ -1,12 +1,36 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: unbreakable_eye_db_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-unbreakable_eye}
+      POSTGRES_USER:     ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-unbreakable_eye}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   fastapi:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.dev
     env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./src:/app/src          # ← live code mounting, edits reflected immediately
       - ./data:/app/data
       - ./models:/app/models
     ports:
       - "8000:8000"             # ← direct access, no nginx in dev
+
+volumes:
+  postgres_data_dev:

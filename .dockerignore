@@ -15,6 +15,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Development artifacts
 .git/
@@ -30,3 +32,6 @@ instance/
 
 # Secrets
 .env
+
+# AI agent tooling — not needed in image
+.mimocode/

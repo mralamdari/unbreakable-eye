@@ -11,12 +11,17 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"       # expose only on localhost — never expose to 0.0.0.0 in production
+      - "127.0.0.1:5432:5432"       # bind to localhost only — never expose to 0.0.0.0
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-unbreakable_eye}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
 
   fastapi:
     build:
@@ -25,6 +30,8 @@ services:
     container_name: unbreakable_eye_api
     restart: unless-stopped
     env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres    # override: Docker always uses postgres service
     depends_on:
       postgres:
         condition: service_healthy   # wait for DB to be ready before starting app
@@ -32,6 +39,17 @@ services:
       - ./data:/app/data
       - ./models:/app/models
       - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
 
   nginx:
     image: nginx:alpine

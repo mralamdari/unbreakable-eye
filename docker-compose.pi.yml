@@ -1,0 +1,20 @@
+# docker-compose.pi.yml — Raspberry Pi overlay
+# Usage: docker compose -f docker-compose.yml -f docker-compose.pi.yml up
+#
+# Optimized for Raspberry Pi 4/5 with reduced resolution and CPU threads
+
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.pi
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 2G
+    environment:
+      - DEVICE=cpu
+      - WORKING_WIDTH=256
+      - WORKING_HEIGHT=256
+      - OMP_NUM_THREADS=4

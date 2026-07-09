@@ -13,7 +13,7 @@ from src.core.exceptions import ModelLoadError, InferenceError
 try:
     from ultralytics import YOLO
 except ImportError:
-    raise ImportError("ultralytics not installed. Install with: pip install ultralytics")
+    YOLO = None  # loaded lazily — only fails when UltralyticsDetector is instantiated
 
 
 class UltralyticsDetector(BaseDetector):
@@ -32,6 +32,11 @@ class UltralyticsDetector(BaseDetector):
         Raises:
             ModelLoadError: If model cannot be loaded
         """
+        if YOLO is None:
+            raise ModelLoadError(
+                "ultralytics is not installed. Run: pip install ultralytics",
+                context={"model_path": model_path},
+            )
         self.confidence_threshold = conf_thresh
         self.device = device.lower()
 

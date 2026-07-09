@@ -3,78 +3,257 @@
 {% block content %}
 <h2>Analytics Dashboard</h2>
 
-<!-- Overview -->
-<div class="card">
-  <h3>Overview</h3>
-  <p>Total unique customers: <span id="total-customers">--</span></p>
-  <p>Total detections: <span id="total-detections">--</span></p>
-  <p>Active now: <span id="active-now">--</span></p>
+<!-- KPI Cards Row -->
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="kpi-value" id="total-customers">--</div>
+    <div class="kpi-label">Total Visitors</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-value" id="active-now">--</div>
+    <div class="kpi-label">Currently In Store</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-value" id="total-detections">--</div>
+    <div class="kpi-label">Total Detections</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-value" id="avg-dwell">--</div>
+    <div class="kpi-label">Avg Dwell Time</div>
+  </div>
 </div>
 
-<!-- Footfall chart -->
-<canvas id="footfallChart" width="400" height="200"></canvas>
+<!-- Footfall Chart -->
+<div class="card">
+  <h3>Footfall Over Time</h3>
+  <div class="chart-controls">
+    <button class="chart-btn active" data-days="1">Today</button>
+    <button class="chart-btn" data-days="7">7 Days</button>
+    <button class="chart-btn" data-days="30">30 Days</button>
+  </div>
+  <canvas id="footfallChart" height="200"></canvas>
+</div>
 
-<!-- Occupancy chart -->
-<canvas id="occupancyChart" width="400" height="200"></canvas>
+<!-- Zone Performance -->
+<div class="card">
+  <h3>Zone Performance</h3>
+  <div id="zone-stats-container">
+    <p class="muted">No zones configured yet. Draw zones on the Monitor page.</p>
+  </div>
+</div>
 
-<!-- Dwell time histogram -->
-<div id="dwellChart" style="width:400px; height:200px;">
-  <!-- placeholder, can use a bar chart -->
+<!-- Dwell Time Distribution -->
+<div class="card">
+  <h3>Dwell Time Distribution</h3>
+  <canvas id="dwellChart" height="200"></canvas>
+</div>
+
+<!-- Repeat Visitors -->
+<div class="card">
+  <h3>New vs Returning Visitors</h3>
+  <canvas id="repeatChart" height="200"></canvas>
+</div>
+
+<!-- Peak Hours Heatmap -->
+<div class="card">
+  <h3>Peak Hours</h3>
+  <p class="muted">Busiest times of the week (darker = more visitors)</p>
+  <div id="peak-hours-grid" class="peak-grid"></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-async function loadData() {
-  // Overview
-  const over = await fetch('/api/analysis/overview').then(r=>r.json());
-  document.getElementById('total-customers').textContent = over.total_customers;
-  document.getElementById('total-detections').textContent = over.total_detections;
-  document.getElementById('active-now').textContent = over.active_now;
+const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
-  // Footfall
-  const foot = await fetch('/api/analysis/footfall?interval=day').then(r=>r.json());
-  new Chart(document.getElementById('footfallChart'), {
-    type: 'line',
-    data: {
-      labels: foot.map(d=>d.bucket),
-      datasets: [{
-        label: 'Detections per Day',
-        data: foot.map(d=>d.count),
-        borderColor: 'blue'
-      }]
-    }
-  });
-
-  // Occupancy
-  const occ = await fetch('/api/analysis/occupancy').then(r=>r.json());
-  new Chart(document.getElementById('occupancyChart'), {
-    type: 'line',
-    data: {
-      labels: occ.map(d=>d.time),
-      datasets: [{
-        label: 'Occupancy (distinct people)',
-        data: occ.map(d=>d.occupancy),
-        borderColor: 'green'
-      }]
-    }
-  });
-
-  // Dwell histogram (simple bar)
-  const dwell = await fetch('/api/analysis/dwell').then(r=>r.json());
-  const ctx = document.createElement('canvas');
-  document.getElementById('dwellChart').appendChild(ctx);
-  new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: Object.keys(dwell),
-      datasets: [{
-        label: 'Visit Duration',
-        data: Object.values(dwell),
-        backgroundColor: 'orange'
-      }]
-    }
-  });
+async function loadOverview() {
+  try {
+    const data = await fetch('/api/analysis/overview').then(r => r.json());
+    document.getElementById('total-customers').textContent = data.total_customers || 0;
+    document.getElementById('active-now').textContent = data.active_now || 0;
+    document.getElementById('total-detections').textContent = data.total_detections || 0;
+  } catch(e) { console.error('Overview error:', e); }
 }
-loadData();
+
+let footfallChart = null;
+async function loadFootfall(days = 7) {
+  try {
+    const data = await fetch(`/api/analysis/footfall?days=${days}`).then(r => r.json());
+    const labels = data.map(d => {
+      const date = new Date(d.bucket * 1000);
+      return date.toLocaleDateString() + ' ' + date.getHours() + ':00';
+    });
+    const values = data.map(d => d.visitors);
+
+    if (footfallChart) footfallChart.destroy();
+    footfallChart = new Chart(document.getElementById('footfallChart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Visitors',
+          data: values,
+          borderColor: '#4f8cff',
+          backgroundColor: 'rgba(79, 140, 255, 0.1)',
+          fill: true,
+          tension: 0.3,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { color: '#222' }, ticks: { color: '#9aa0a6' } },
+          y: { grid: { color: '#222' }, ticks: { color: '#9aa0a6' } }
+        }
+      }
+    });
+  } catch(e) { console.error('Footfall error:', e); }
+}
+
+async function loadDwell() {
+  try {
+    const data = await fetch('/api/analysis/dwell').then(r => r.json());
+    new Chart(document.getElementById('dwellChart'), {
+      type: 'bar',
+      data: {
+        labels: Object.keys(data),
+        datasets: [{
+          label: 'Visitors',
+          data: Object.values(data),
+          backgroundColor: '#FF7F66',
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { color: '#222' }, ticks: { color: '#9aa0a6' } },
+          y: { grid: { color: '#222' }, ticks: { color: '#9aa0a6' } }
+        }
+      }
+    });
+  } catch(e) { console.error('Dwell error:', e); }
+}
+
+async function loadRepeatVisitors() {
+  try {
+    const data = await fetch('/api/analysis/repeat-visitors').then(r => r.json());
+    new Chart(document.getElementById('repeatChart'), {
+      type: 'doughnut',
+      data: {
+        labels: ['New Visitors', 'Returning Visitors'],
+        datasets: [{
+          data: [data.new_visitors || 0, data.return_visitors || 0],
+          backgroundColor: ['#4f8cff', '#66BB6A'],
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { position: 'bottom', labels: { color: '#e8eaed' } }
+        }
+      }
+    });
+  } catch(e) { console.error('Repeat visitors error:', e); }
+}
+
+async function loadZoneStats() {
+  try {
+    const data = await fetch('/api/analysis/zone-stats').then(r => r.json());
+    const container = document.getElementById('zone-stats-container');
+    if (!data.length) {
+      container.innerHTML = '<p class="muted">No zones configured yet. Draw zones on the Monitor page.</p>';
+      return;
+    }
+    container.innerHTML = data.map(z => `
+      <div class="zone-stat-card" style="border-left: 4px solid ${z.color || '#4f8cff'}">
+        <div class="zone-stat-name">${z.name}</div>
+        <div class="zone-stat-metrics">
+          <span>In: ${z.entries || 0}</span>
+          <span>Out: ${z.exits || 0}</span>
+          <span>Avg: ${(z.avg_dwell || 0).toFixed(1)}s</span>
+          <span>Unique: ${z.unique_visitors || 0}</span>
+        </div>
+      </div>
+    `).join('');
+  } catch(e) { console.error('Zone stats error:', e); }
+}
+
+async function loadPeakHours() {
+  try {
+    const data = await fetch('/api/analysis/peak-hours').then(r => r.json());
+    const container = document.getElementById('peak-hours-grid');
+    if (!data.length) {
+      container.innerHTML = '<p class="muted">No data yet.</p>';
+      return;
+    }
+
+    // Build 7x24 grid
+    const grid = Array.from({length: 7}, () => Array(24).fill(0));
+    data.forEach(r => { grid[r.dow][r.hour] = r.total; });
+
+    const maxVal = Math.max(...grid.flat(), 1);
+    let html = '<div class="peak-grid-inner">';
+    // Header row
+    html += '<div class="peak-cell peak-label"></div>';
+    for (let h = 0; h < 24; h++) {
+      html += `<div class="peak-cell peak-label">${h}</div>`;
+    }
+    // Data rows
+    for (let d = 0; d < 7; d++) {
+      html += `<div class="peak-cell peak-label">${DAYS[d]}</div>`;
+      for (let h = 0; h < 24; h++) {
+        const intensity = grid[d][h] / maxVal;
+        const r = Math.round(79 + intensity * (255 - 79));
+        const g = Math.round(140 - intensity * 140);
+        const b = Math.round(255 - intensity * 200);
+        html += `<div class="peak-cell" style="background:rgb(${r},${g},${b})" title="${DAYS[d]} ${h}:00 - ${grid[d][h]} visitors"></div>`;
+      }
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) { console.error('Peak hours error:', e); }
+}
+
+// Chart period buttons
+document.querySelectorAll('.chart-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.chart-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    loadFootfall(parseInt(btn.dataset.days));
+  });
+});
+
+// Load all data
+loadOverview();
+loadFootfall(7);
+loadDwell();
+loadRepeatVisitors();
+loadZoneStats();
+loadPeakHours();
+
+// Auto-refresh every 30 seconds
+setInterval(() => {
+  loadOverview();
+  loadZoneStats();
+}, 30000);
 </script>
+
+<style>
+  .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .kpi-card { background: var(--card); border: 1px solid #222; border-radius: 10px; padding: 16px; text-align: center; }
+  .kpi-value { font-size: 2em; font-weight: 700; color: var(--accent); }
+  .kpi-label { color: var(--muted); font-size: 0.9em; margin-top: 4px; }
+  .chart-controls { display: flex; gap: 8px; margin-bottom: 12px; }
+  .chart-btn { background: transparent; border: 1px solid #333; color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
+  .chart-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .muted { color: var(--muted); font-size: 0.9em; }
+  .zone-stat-card { background: var(--card); border: 1px solid #222; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+  .zone-stat-name { font-weight: 600; margin-bottom: 4px; }
+  .zone-stat-metrics { display: flex; gap: 16px; color: var(--muted); font-size: 0.85em; }
+  .peak-grid-inner { display: grid; grid-template-columns: 40px repeat(24, 1fr); gap: 2px; }
+  .peak-cell { height: 24px; border-radius: 3px; }
+  .peak-label { display: flex; align-items: center; justify-content: center; font-size: 0.7em; color: var(--muted); }
+  @media (max-width: 800px) { .kpi-row { grid-template-columns: repeat(2, 1fr); } }
+</style>
 {% endblock %}

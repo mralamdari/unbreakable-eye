@@ -54,14 +54,15 @@ def _register_vector_type(conn) -> None:
     SELECT returns Python lists instead of raw strings.
 
     Called once per new connection, right after getconn().
+    Gracefully skips if the extension hasn't been created yet (init_db() handles that).
     """
     with conn.cursor() as cur:
         cur.execute("SELECT oid FROM pg_type WHERE typname = 'vector'")
         row = cur.fetchone()
     if row is None:
-        raise RuntimeError(
-            "pgvector extension not found — run 'CREATE EXTENSION vector' first."
-        )
+        # Extension not created yet — init_db() will create it.
+        # Return silently so the first connection during startup doesn't crash.
+        return
     oid = row[0] if isinstance(row, (list, tuple)) else row["oid"]
     vector_type = psycopg2.extensions.new_type(
         (oid,), "VECTOR", _parse_vector
@@ -269,6 +270,83 @@ def init_db() -> None:
                     timestamp       DOUBLE PRECISION NOT NULL,
                     embedding_id    BIGINT REFERENCES embeddings(id)
                 )
+            """)
+
+            # Zone definitions per camera
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS zones (
+                    id          BIGSERIAL PRIMARY KEY,
+                    camera_id   BIGINT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+                    name        TEXT NOT NULL,
+                    polygon     JSONB NOT NULL,
+                    zone_type   TEXT DEFAULT 'area',
+                    color       TEXT DEFAULT '#4f8cff',
+                    created_at  DOUBLE PRECISION NOT NULL
+                )
+            """)
+
+            # Zone entry/exit events
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS zone_events (
+                    id            BIGSERIAL PRIMARY KEY,
+                    zone_id       BIGINT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+                    camera_id     BIGINT NOT NULL REFERENCES cameras(id),
+                    customer_id   BIGINT REFERENCES customers(id),
+                    tracker_id    INTEGER,
+                    event_type    TEXT NOT NULL,
+                    timestamp     DOUBLE PRECISION NOT NULL,
+                    dwell_seconds REAL DEFAULT 0
+                )
+            """)
+
+            # Aggregated analytics (hourly snapshots per camera)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS analytics_hourly (
+                    id               BIGSERIAL PRIMARY KEY,
+                    camera_id        BIGINT NOT NULL REFERENCES cameras(id),
+                    hour_bucket      DOUBLE PRECISION NOT NULL,
+                    unique_visitors  INTEGER DEFAULT 0,
+                    total_detections INTEGER DEFAULT 0,
+                    avg_dwell_secs   REAL DEFAULT 0,
+                    peak_occupancy   INTEGER DEFAULT 0,
+                    new_visitors     INTEGER DEFAULT 0,
+                    return_visitors  INTEGER DEFAULT 0
+                )
+            """)
+
+            # Raw detection events (retained for RAW_RETENTION_DAYS)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS detection_events (
+                    id          BIGSERIAL PRIMARY KEY,
+                    camera_id   BIGINT NOT NULL REFERENCES cameras(id),
+                    tracker_id  INTEGER,
+                    customer_id BIGINT REFERENCES customers(id),
+                    timestamp   DOUBLE PRECISION NOT NULL,
+                    bbox_x1     REAL,
+                    bbox_y1     REAL,
+                    bbox_x2     REAL,
+                    bbox_y2     REAL,
+                    confidence  REAL,
+                    center_x    REAL,
+                    center_y    REAL,
+                    zone_id     BIGINT REFERENCES zones(id),
+                    velocity_x  REAL DEFAULT 0,
+                    velocity_y  REAL DEFAULT 0
+                )
+            """)
+
+            # Indexes for analytics queries
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_zone_events_camera_time
+                ON zone_events (camera_id, timestamp)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_detection_events_camera_time
+                ON detection_events (camera_id, timestamp)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_analytics_hourly_bucket
+                ON analytics_hourly (camera_id, hour_bucket)
             """)
 
     logger.info("Database schema initialised (PostgreSQL + pgvector)")
@@ -643,6 +721,146 @@ def purge_old_embeddings(conn, days: int = 30) -> int:
         deleted = cur.rowcount
     logger.info(f"Purged {deleted} embeddings older than {days} days")
     return deleted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics retention
+# ─────────────────────────────────────────────────────────────────────────────
+
+def purge_old_detection_events(conn, days: int = 7) -> int:
+    """Delete raw detection events older than *days* days."""
+    cutoff = datetime.now().timestamp() - days * 86_400
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM detection_events WHERE timestamp < %s", (cutoff,))
+        deleted = cur.rowcount
+    if deleted:
+        logger.info(f"Purged {deleted} detection events older than {days} days")
+    return deleted
+
+
+def purge_old_analytics(conn, days: int = 30) -> int:
+    """Delete aggregated analytics older than *days* days."""
+    cutoff = datetime.now().timestamp() - days * 86_400
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM analytics_hourly WHERE hour_bucket < %s", (cutoff,))
+        deleted = cur.rowcount
+    if deleted:
+        logger.info(f"Purged {deleted} analytics_hourly rows older than {days} days")
+    return deleted
+
+
+def purge_old_zone_events(conn, days: int = 30) -> int:
+    """Delete zone events older than *days* days."""
+    cutoff = datetime.now().timestamp() - days * 86_400
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM zone_events WHERE timestamp < %s", (cutoff,))
+        deleted = cur.rowcount
+    if deleted:
+        logger.info(f"Purged {deleted} zone events older than {days} days")
+    return deleted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zone CRUD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_zones_for_camera(conn, camera_id: int) -> list:
+    """Return all zones for a camera."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, camera_id, name, polygon, zone_type, color FROM zones WHERE camera_id = %s ORDER BY id",
+            (camera_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def create_zone(conn, camera_id: int, name: str, polygon: list, zone_type: str = "area", color: str = "#4f8cff") -> int:
+    """Insert a new zone and return its id."""
+    import json
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO zones (camera_id, name, polygon, zone_type, color, created_at)
+               VALUES (%s, %s, %s::jsonb, %s, %s, %s) RETURNING id""",
+            (camera_id, name, json.dumps(polygon), zone_type, color, datetime.now().timestamp()),
+        )
+        return cur.fetchone()["id"]
+
+
+def delete_zone(conn, zone_id: int) -> bool:
+    """Delete a zone by id. Returns True if it existed."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM zones WHERE id = %s", (zone_id,))
+        return cur.rowcount > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics queries (implementing the stubs in analysis.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_footfall(conn, camera_id: int, interval: str = "hour", days: int = 7) -> list:
+    """Time-bucketed footfall counts from analytics_hourly."""
+    cutoff = datetime.now().timestamp() - days * 86_400
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT hour_bucket, unique_visitors, total_detections
+               FROM analytics_hourly
+               WHERE camera_id = %s AND hour_bucket > %s
+               ORDER BY hour_bucket""",
+            (camera_id, cutoff),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_peak_hours(conn, camera_id: int) -> list:
+    """Aggregate hourly visitors into a 7x24 grid (day-of-week x hour)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT EXTRACT(DOW FROM TO_TIMESTAMP(hour_bucket)) AS dow,
+                      EXTRACT(HOUR FROM TO_TIMESTAMP(hour_bucket)) AS hour,
+                      SUM(unique_visitors) AS total
+               FROM analytics_hourly
+               WHERE camera_id = %s
+               GROUP BY dow, hour
+               ORDER BY dow, hour""",
+            (camera_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_zone_stats(conn, camera_id: int) -> list:
+    """Per-zone entry/exit/dwell metrics."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT z.id, z.name, z.zone_type, z.color,
+                      COUNT(ze.id) FILTER (WHERE ze.event_type='enter') AS entries,
+                      COUNT(ze.id) FILTER (WHERE ze.event_type='exit') AS exits,
+                      AVG(ze.dwell_seconds) FILTER (WHERE ze.event_type='exit') AS avg_dwell,
+                      COUNT(DISTINCT ze.customer_id) AS unique_visitors
+               FROM zones z
+               LEFT JOIN zone_events ze ON ze.zone_id = z.id
+               WHERE z.camera_id = %s
+               GROUP BY z.id, z.name, z.zone_type, z.color
+               ORDER BY z.id""",
+            (camera_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_repeat_visitors(conn, camera_id: int, days: int = 30) -> dict:
+    """New vs return visitor counts."""
+    cutoff = datetime.now().timestamp() - days * 86_400
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT
+                 COUNT(DISTINCT e.customer_id) FILTER (WHERE c.total_visits = 1) AS new_visitors,
+                 COUNT(DISTINCT e.customer_id) FILTER (WHERE c.total_visits > 1) AS return_visitors
+               FROM embeddings e
+               JOIN customers c ON c.id = e.customer_id
+               WHERE e.camera_id = %s AND e.timestamp > %s""",
+            (camera_id, cutoff),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else {"new_visitors": 0, "return_visitors": 0}
 
 
 def min_distance_to_customer(

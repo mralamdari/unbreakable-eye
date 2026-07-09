@@ -19,6 +19,3 @@ def get_repeat_visitors(cam_id: int, days: int = 7) -> list[dict]:
 def get_peak_hours(cam_id: int) -> list[dict]:
     """Hourly visitor counts to find busy periods."""
     ...
-    
-These functions feed your `/api/state` endpoint and your analytics dashboard. They're pure database reads — no inference, no pipeline coupling.
-    

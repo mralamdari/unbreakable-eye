@@ -1,50 +1,3 @@
-# # STAGE 1: Builder (Compiling dependencies)
-# FROM python:3.10-slim as builder
-
-# WORKDIR /app
-
-# # Install system build tools
-# RUN apt-get update && apt-get install -y gcc
-
-# # Install Python Manager
-# RUN pip install poetry
-
-# COPY pyproject.toml poetry.lock ./
-
-# # Export to requirements.txt (easier for slim builds)
-# RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
-
-# # STAGE 2: Runtime (The actual container)
-# FROM python:3.10-slim
-
-# WORKDIR /app
-
-# # Install OpenCV system dependencies (Critical for cv2-headless)
-# RUN apt-get update && apt-get install -y \
-#     libgl1-mesa-glx \
-#     libglib2.0-0 \
-#     && rm -rf /var/lib/apt/lists/*
-
-# # Install Python dependencies
-# COPY --from=builder /app/requirements.txt .
-# RUN pip install --no-cache-dir -r requirements.txt
-
-# # Copy Your Code
-# COPY src/ ./src/
-# COPY models/ ./models/ 
-# # ^ Note: Only copy models if they are small. 
-# # For big models, mount a volume instead!
-
-# # Create non-root user
-# RUN useradd -m appuser
-# USER appuser
-
-# # Environment Variables (Defaults)
-# ENV PYTHONPATH=/app
-# ENV PYTHONUNBUFFERED=1
-
-# # Run the Server
-# CMD ["python", "-m", "src.server.main"]
 
 
 
@@ -55,20 +8,30 @@
 
 
 
+FROM python:3.10-slim AS builder
 
-
-
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 FROM python:3.10-slim
 
+# Runtime deps for opencv-headless (minimal)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libxcb1 \
+    libxext6 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy only installed packages from builder (no pip cache, no build tools)
+COPY --from=builder /install /usr/local
 
 COPY src/ ./src/
-COPY models/ ./models/
+RUN mkdir -p /app/models
 
-# Non-root user for security
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
 

@@ -21,9 +21,7 @@ from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError,
 try:
     import openvino as ov
 except ImportError:
-    raise ImportError(
-        "openvino not installed. Run: pip install openvino"
-    )
+    ov = None  # loaded lazily — only fails when OpenVinoDetector is instantiated
 
 
 class OpenVinoDetector(BaseDetector):
@@ -44,6 +42,11 @@ class OpenVinoDetector(BaseDetector):
         Raises:
             ModelLoadError: If the model cannot be loaded or compiled.
         """
+        if ov is None:
+            raise ModelLoadError(
+                "openvino is not installed. Run: pip install openvino",
+                context={"model_path": model_path},
+            )
         self.confidence_threshold = conf_thresh
         self.device               = device.upper()
 

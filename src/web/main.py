@@ -115,6 +115,7 @@ async def run_db(fn, *args):
 # ─────────────────────────────────────────────────────────────────────────────
 processors        = {}   # cam_id -> VisionPipeline (running pipelines only)
 batched_det_proc  = None
+shared_embedder_proc = None
 frame_ready_queue = None
 det_queues        = {}
 free_slots_queues = {}
@@ -129,6 +130,10 @@ cameras_dirty     = False  # True when DB camera list changed since last apply
 _pipelines_booted = False  # set True once apply_changes has run since process start
 analytics_queue       = None
 analytics_writer_proc = None
+
+# Shared embedding worker state
+embed_input_queue = None   # mp.Queue: all cameras send crops here
+embed_output_queues = {}   # cam_id -> mp.Queue: results back to each embedder
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,6 +167,46 @@ def _stop_batched_detector():
     batched_det_proc = None
 
 
+def _start_shared_embedder() -> mp.Process:
+    """Start the shared embedding worker that owns ONE OSNet session for all cameras."""
+    global embed_input_queue, embed_output_queues
+    embed_input_queue = CTX.Queue(maxsize=16)
+    # Create output queues for each camera
+    for cam_id in list(processors.keys()):
+        if cam_id not in embed_output_queues:
+            embed_output_queues[cam_id] = CTX.Queue(maxsize=4)
+
+    p = CTX.Process(
+        target=shared_embedder_worker,
+        args=(
+            embed_input_queue,
+            embed_output_queues,
+            global_stop_event,
+        ),
+        daemon=True,
+    )
+    p.start()
+    logger.info(f"Shared embedding worker started (pid={p.pid})")
+    return p
+
+
+def _stop_shared_embedder():
+    global shared_embedder_proc, embed_input_queue, embed_output_queues
+    if shared_embedder_proc is not None and shared_embedder_proc.is_alive():
+        # Send shutdown signal
+        try:
+            embed_input_queue.put_nowait((None, None, None, None))
+        except Exception:
+            pass
+        shared_embedder_proc.join(timeout=3)
+        if shared_embedder_proc.is_alive():
+            shared_embedder_proc.terminate()
+        logger.info("Shared embedding worker stopped")
+    shared_embedder_proc = None
+    embed_input_queue = None
+    embed_output_queues = {}
+
+
 def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
     free_slots     = CTX.Queue(maxsize=4)
     det_queue      = CTX.Queue(maxsize=4)
@@ -172,6 +217,10 @@ def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
     free_slots_queues[cam_id] = free_slots
     response_queues[cam_id]   = response_queue
     stop_events[cam_id]       = cam_stop_event
+
+    # Create output queue for this camera's embedding results
+    if cam_id not in embed_output_queues:
+        embed_output_queues[cam_id] = CTX.Queue(maxsize=4)
 
     processor = VisionPipeline(
         RTSP_URL=stream_url,
@@ -184,6 +233,8 @@ def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
         response_queue=response_queue,
         frame_ready_queue=frame_ready_queue,
         analytics_queue=analytics_queue,
+        embed_input_queue=embed_input_queue,
+        embed_output_queue=embed_output_queues[cam_id],
     )
     shm_names[cam_id] = processor.input_shm_name
     return processor
@@ -294,7 +345,10 @@ def _startup_sync(user_cameras: list) -> None:
     # 4. ONE batched_detector — single YOLO session for all cameras
     batched_det_proc = _start_batched_detector()
 
-    # 5. Start all readers + embedders simultaneously
+    # 5. ONE shared_embedder — single OSNet session for all cameras
+    shared_embedder_proc = _start_shared_embedder()
+
+    # 6. Start all readers + embedders simultaneously
     for proc in processors.values():
         try:
             proc.start()
@@ -303,7 +357,7 @@ def _startup_sync(user_cameras: list) -> None:
 
     logger.info(
         f"Startup complete — {len(processors)} camera(s) live, "
-        f"1 YOLO session shared across all"
+        f"1 YOLO session + 1 OSNet session shared across all"
     )
 
 
@@ -368,7 +422,8 @@ async def lifespan(app: FastAPI):
     processors.clear()
 
     _stop_batched_detector()                          # 1. detector first
-    for cam_id, proc in snapshot.items():             # 2. per-camera workers
+    _stop_shared_embedder()                           # 2. shared embedder
+    for cam_id, proc in snapshot.items():             # 3. per-camera workers
         try:
             proc.stop()
         except Exception as e:

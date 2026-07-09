@@ -2,6 +2,7 @@ import os
 import cv2
 import time
 import queue
+import uuid
 import psutil
 import functools
 import numpy as np
@@ -17,6 +18,52 @@ from src.engine.heatmap import HeatmapAccumulator
 from multiprocessing import shared_memory
 
 SKIP_FRAME = (None, None, None, None)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED EMBEDDING WORKER
+#
+# Single process that owns ONE OSNet session for ALL cameras.
+# Each embedder_worker sends crops here, gets embeddings back.
+# This eliminates the per-camera ONNX session that was causing OOM crashes.
+# ─────────────────────────────────────────────────────────────────────────────
+def shared_embedder_worker(
+    embed_input_queue,    # mp.Queue: (request_id, cam_id, crops_onnx, crop_meta)
+    embed_output_queues,  # dict[cam_id -> mp.Queue]: results back to each embedder
+    stop_event,
+):
+    """
+    Single process that owns ONE OSNet session for ALL cameras.
+    Receives crops from all embedder_workers, runs batched inference,
+    routes embeddings back to each camera's embedder_worker.
+    """
+    pin_process([4,5])
+    embedder_session = create_session(settings.FEATURE_EXTRACTOR_MODEL, num_threads=2)
+    logger.info("Shared embedding worker started with single OSNet session")
+
+    while not stop_event.is_set():
+        try:
+            request_id, cam_id, crops_onnx, crop_meta = embed_input_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if request_id is None:
+            break  # shutdown signal
+
+        # Run batched inference on the crops
+        if crops_onnx:
+            batch_input = np.stack(crops_onnx, axis=0)
+            embeddings = embedder_session.run(None, {"input": batch_input})[0]
+        else:
+            embeddings = np.array([])
+
+        # Send results back to the requesting camera's embedder
+        try:
+            embed_output_queues[cam_id].put_nowait((request_id, embeddings, crop_meta))
+        except queue.Full:
+            logger.warning(f"Embed output queue full for camera {cam_id}, dropping results")
+            continue
+
+    logger.info("Shared embedding worker stopped")
 
 # ─────────────────────────────────────────────────────────────────────────
 # CLIENT-FACING OVERLAY CONFIG
@@ -106,6 +153,8 @@ class VisionPipeline:
                 db_queue,
                 response_queue,
                 analytics_queue=None,
+                embed_input_queue=None,
+                embed_output_queue=None,
                 buffer_slots=4):
                 
         #         embedder_worker
@@ -246,6 +295,10 @@ class VisionPipeline:
         # the offline image or the live stream.
         self.has_frame = self.ctx.Value('b', 0)
 
+        # Shared embedding worker queues
+        self.embed_input_queue = embed_input_queue
+        self.embed_output_queue = embed_output_queue
+
     def _cleanup_shm(self) -> None:
         """Close and unlink both SHM blocks exactly once (idempotent)."""
         if self._shm_cleaned_up:
@@ -287,6 +340,8 @@ class VisionPipeline:
                 self.cam_id,
                 self.has_frame,
                 self.analytics_queue,
+                self.embed_input_queue,
+                self.embed_output_queue,
             ),
             daemon=True
         )
@@ -542,6 +597,8 @@ def process_frame(
     blur_annotator=None,
     heatmap_accumulator=None,
     analytics_queue=None,
+    precomputed_embeddings=None,
+    precomputed_crop_meta=None,
 ):
     # `frame` stays at native inference resolution end-to-end — it's what
     # embedding crops and zone/dwell logic are computed against, exactly as
@@ -693,10 +750,17 @@ def process_frame(
     # This avoids any index mismatch — we join to detections later by tracker_id
     label_map = {}   # tracker_id -> label string
 
-    if crops_onnx and run_embedding:
+    # Use pre-computed embeddings from shared worker, or compute locally
+    if precomputed_embeddings is not None and precomputed_crop_meta is not None:
+        embeddings = precomputed_embeddings
+        crop_meta = precomputed_crop_meta
+    elif crops_onnx and run_embedding and embedder_session is not None:
         batch_input = np.stack(crops_onnx, axis=0)
         embeddings = embedder_session.run(None, {"input": batch_input})[0]
+    else:
+        embeddings = None
 
+    if embeddings is not None and len(embeddings) > 0:
         for i, emb in enumerate(embeddings):
             emb = emb.flatten()
             emb = emb / (np.linalg.norm(emb) + 1e-8)
@@ -1019,12 +1083,14 @@ def embedder_worker(
     cam_id,
     has_frame,
     analytics_queue=None,
+    embed_input_queue=None,
+    embed_output_queue=None,
 ):
     pin_process([4,5])
     input_shm = shared_memory.SharedMemory(name=input_shm_name)
     native_shm = shared_memory.SharedMemory(name=native_shm_name)
     output_shm = shared_memory.SharedMemory(name=output_shm_name)
-    embedder_session = create_session(settings.FEATURE_EXTRACTOR_MODEL, num_threads=1)
+    # NOTE: OSNet session is now in shared_embedder_worker — no local session needed
     # TODO: swap for a real store/location name once that's configurable
     # per camera (e.g. settings.CAMERA_LABELS[cam_id]) — "CAM 1" is a
     # placeholder that's still better than nothing on a client-facing feed.
@@ -1180,13 +1246,47 @@ def embedder_worker(
         else:
             render_scale = (1.0, 1.0)
 
+        # Extract crops for embedding (before calling process_frame)
+        precomputed_embeddings = None
+        precomputed_crop_meta = None
+        if run_embedding and embed_input_queue is not None and embed_output_queue is not None:
+            crops_onnx = []
+            crop_meta_list = []
+            for det in detections:
+                det_box, det_mask, det_conf, class_id, tracker_id, data = det
+                if tracker_id is None:
+                    continue
+                input_tensor, crop_box, center_point, bbox_w, bbox_h, crop_flag = preprocess_crop(
+                    frame, det_box,
+                    model_input_size=(256, 128),
+                    torso_ratio=1)
+                if not crop_flag:
+                    unique_visitors.add(tracker_id)
+                    crops_onnx.append(input_tensor)
+                    crop_meta_list.append((
+                        crop_box, center_point, bbox_w, bbox_h,
+                        int(tracker_id), det_conf))
+
+            if crops_onnx:
+                # Send crops to shared embedding worker
+                request_id = f"emb_{cam_id}_{time.time()}"
+                try:
+                    embed_input_queue.put_nowait((request_id, cam_id, crops_onnx, crop_meta_list))
+                    # Wait for embeddings from shared worker
+                    result_id, embeddings, crop_meta = embed_output_queue.get(timeout=1.0)
+                    if result_id == request_id:
+                        precomputed_embeddings = embeddings
+                        precomputed_crop_meta = crop_meta
+                except (queue.Empty, queue.Full) as e:
+                    logger.warning(f"Shared embedder timeout/error for camera {cam_id}: {e}")
+
         annotated = process_frame(
             frame=frame,
             display_frame=render_frame,
             scale=render_scale,
             detections=detections,
             tracker=tracker,
-            embedder_session=embedder_session,
+            embedder_session=None,  # No local session — using shared worker
             track_to_customer=track_to_customer,
             db_queue=db_queue,
             cam_id=cam_id,
@@ -1209,7 +1309,9 @@ def embedder_worker(
             run_embedding=run_embedding,
             blur_annotator=blur_annotator,
             heatmap_accumulator=heatmap_accumulator,
-            analytics_queue=analytics_queue
+            analytics_queue=analytics_queue,
+            precomputed_embeddings=precomputed_embeddings,
+            precomputed_crop_meta=precomputed_crop_meta,
         )
 
         # annotated is already at display resolution — process_frame drew

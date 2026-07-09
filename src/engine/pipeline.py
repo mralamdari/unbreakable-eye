@@ -1357,14 +1357,15 @@ def batched_detector_worker(
     # the lifetime of this process.
     n_cams     = len(shm_blocks)
     detector   = get_detector()   # one YOLO session for ALL cameras
+    max_batch  = min(n_cams, 2)   # cap at 2 to avoid ONNX segfaults with 3+ cams
 
     while not stop_event.is_set():
 
         # ── Collect a batch: wait up to batch_timeout for frames ──────────
-        pending = {}   # cam_id -> slot_idx 
+        pending = {}   # cam_id -> slot_idx
         deadline = time.time() + batch_timeout
 
-        while len(pending) < n_cams:
+        while len(pending) < max_batch:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break

@@ -163,6 +163,9 @@ def _stop_batched_detector():
     if batched_det_proc is not None and batched_det_proc.is_alive():
         batched_det_proc.terminate()
         batched_det_proc.join(timeout=3)
+        if batched_det_proc.is_alive():
+            batched_det_proc.kill()  # SIGKILL fallback
+            batched_det_proc.join(timeout=2)
         logger.info("Batched detector stopped")
     batched_det_proc = None
 
@@ -200,7 +203,8 @@ def _stop_shared_embedder():
             pass
         shared_embedder_proc.join(timeout=3)
         if shared_embedder_proc.is_alive():
-            shared_embedder_proc.terminate()
+            shared_embedder_proc.kill()  # SIGKILL fallback
+            shared_embedder_proc.join(timeout=2)
         logger.info("Shared embedding worker stopped")
     shared_embedder_proc = None
     embed_input_queue = None
@@ -289,14 +293,17 @@ def _teardown_sync(snapshot: dict) -> None:
     # 1. Kill batched_detector first — unblocks readers stuck on full queue
     _stop_batched_detector()
 
-    # 2. Stop per-camera readers + embedders
+    # 2. Stop shared embedder — frees OSNet session
+    _stop_shared_embedder()
+
+    # 3. Stop per-camera readers + embedders
     for cam_id, proc in snapshot.items():
         try:
             proc.stop()
         except Exception as e:
             logger.error(f"Teardown error cam {cam_id}: {e}")
 
-    # 3. Shut down db_writer — safe now that all embedders are dead
+    # 4. Shut down db_writer — safe now that all embedders are dead
     if db_writer_proc is not None:
         try:
             db_queue.put(None, timeout=2)

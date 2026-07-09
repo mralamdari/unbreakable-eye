@@ -32,6 +32,7 @@ services:
     env_file: .env
     environment:
       - POSTGRES_HOST=postgres    # override: Docker always uses postgres service
+    shm_size: '2g'               # increase /dev/shm for shared memory (default 64MB too small)
     depends_on:
       postgres:
         condition: service_healthy   # wait for DB to be ready before starting app

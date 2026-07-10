@@ -23,11 +23,13 @@
     <div class="tile-header">
       <span class="badge">ID {{ cam.id }}</span>
       <span class="name">{{ cam.name }}</span>
+      <a href="/camera/{{ cam.id }}" class="zone-draw-btn" onclick="event.stopPropagation();">Manage</a>
     </div>
       <img src="/video_feed/{{ cam.id }}"
            alt="{{ cam.name }}"
            onerror="this.onerror=null; this.src='/static/camera_offline.jpg';"
            style="width:100%; height:100%; object-fit:cover;"/>
+      <canvas class="zone-overlay"></canvas>
   </div>
   {% endfor %}
 
@@ -65,5 +67,5 @@ function zoomExclusive(clickedTile) {
   check();
 })();
 </script>
-<script src="/static/zone-draw.js"></script>
+<script src="/static/monitor-zones.js?t=1"></script>
 {% endblock %}

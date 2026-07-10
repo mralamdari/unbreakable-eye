@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="camera-page">
+  <div class="camera-header">
+    <a href="/monitor" class="back-link">&larr; Monitor</a>
+    <h2>{{ camera.name }}</h2>
+    <button class="zone-draw-btn" id="zone-toggle" onclick="toggleDrawing()">+ Zone</button>
+    <button class="zone-refresh-btn" onclick="refreshFrame()">Refresh frame</button>
+  </div>
+
+  <div class="camera-layout">
+    <div class="camera-view" id="camera-view">
+      <img id="camera-frame"
+           src="/api/frame/{{ camera.id }}"
+           alt="{{ camera.name }}"/>
+      <canvas id="zone-overlay"></canvas>
+      <canvas id="zone-drawing" style="display:none;"></canvas>
+    </div>
+
+    <div class="zone-sidebar" id="zone-sidebar">
+      <h3>Zones</h3>
+      <div id="zone-list"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const CAM_ID = {{ camera.id }};
+  const INITIAL_ZONES = {{ zones | tojson }};
+
+  function refreshFrame() {
+    const img = document.getElementById('camera-frame');
+    img.src = '/api/frame/' + CAM_ID + '?t=' + Date.now();
+  }
+</script>
+<script src="/static/camera-zones.js?t={{ zones | length }}"></script>
+
+{% endblock %}

@@ -37,9 +37,9 @@
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // Zone number badge at centroid
-      var cx = poly.reduce(function (s, p) { return s + p[0]; }, 0) / poly.length * w;
-      var cy = poly.reduce(function (s, p) { return s + p[1]; }, 0) / poly.length * h;
+      // Zone number badge at first vertex (top-left corner)
+      var cx = poly[0][0] * w;
+      var cy = poly[0][1] * h;
       var label = String(idx + 1);
 
       ctx.beginPath();

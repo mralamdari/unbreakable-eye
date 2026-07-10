@@ -90,9 +90,9 @@
       overlayCtx.lineWidth = 2;
       overlayCtx.stroke();
 
-      // Zone number badge at centroid
-      const cx = poly.reduce((s, p) => s + p[0], 0) / poly.length * w;
-      const cy = poly.reduce((s, p) => s + p[1], 0) / poly.length * h;
+      // Zone number badge at first vertex (top-left corner)
+      const cx = poly[0][0] * w;
+      const cy = poly[0][1] * h;
       const label = String(idx + 1);
 
       overlayCtx.beginPath();

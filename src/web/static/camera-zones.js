@@ -1,5 +1,6 @@
 /**
  * Zone overlay and drawing for the dedicated camera page (static frame).
+ * Zone labels are HTML elements (not canvas) so they scale crisply on resize.
  */
 
 (function () {
@@ -14,6 +15,7 @@
   const drawCtx = drawCanvas.getContext('2d');
   const zoneList = document.getElementById('zone-list');
   const toggleBtn = document.getElementById('zone-toggle');
+  const cameraView = document.getElementById('camera-view');
 
   // ── Canvas sizing ───────────────────────────────────────────────────────
 
@@ -70,7 +72,7 @@
     const h = overlayCanvas.height;
     overlayCtx.clearRect(0, 0, w, h);
 
-    zones.forEach((zone, idx) => {
+    zones.forEach((zone) => {
       const poly = zone.polygon;
       if (!poly || poly.length < 3) return;
       const color = zone.color || '#4f8cff';
@@ -89,23 +91,9 @@
       overlayCtx.strokeStyle = color;
       overlayCtx.lineWidth = 2;
       overlayCtx.stroke();
-
-      // Zone number badge at first vertex (top-left corner)
-      const cx = poly[0][0] * w;
-      const cy = poly[0][1] * h;
-      const label = String(idx + 1);
-
-      overlayCtx.beginPath();
-      overlayCtx.arc(cx, cy, 12, 0, Math.PI * 2);
-      overlayCtx.fillStyle = color;
-      overlayCtx.fill();
-
-      overlayCtx.fillStyle = '#fff';
-      overlayCtx.font = 'bold 12px sans-serif';
-      overlayCtx.textAlign = 'center';
-      overlayCtx.textBaseline = 'middle';
-      overlayCtx.fillText(label, cx, cy);
     });
+
+    updateLabels();
   }
 
   function hexToRgba(hex, alpha) {
@@ -113,6 +101,44 @@
     const g = parseInt(hex.slice(3, 5), 16);
     const b = parseInt(hex.slice(5, 7), 16);
     return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+  }
+
+  // ── HTML zone labels ───────────────────────────────────────────────────
+
+  const LABEL_VERTICAL_OFFSET = 6;
+
+  function updateLabels() {
+    // Remove old labels
+    cameraView.querySelectorAll('.zone-label').forEach(el => el.remove());
+
+    const w = overlayCanvas.width;
+    const h = overlayCanvas.height;
+    if (!w || !h) return;
+
+    zones.forEach((zone, idx) => {
+      const poly = zone.polygon;
+      if (!poly || poly.length < 3) return;
+
+      // Find top-right of bounding box
+      let maxX = -Infinity, minY = Infinity;
+      poly.forEach(p => {
+        if (p[0] * w > maxX) maxX = p[0] * w;
+        if (p[1] * h < minY) minY = p[1] * h;
+      });
+
+      const div = document.createElement('div');
+      div.className = 'zone-label';
+      div.textContent = zone.name || 'Zone ' + (idx + 1);
+      div.style.backgroundColor = zone.color || '#4f8cff';
+
+      // Position relative to the overlay canvas
+      const canvasLeft = parseInt(overlayCanvas.style.left) || 0;
+      const canvasTop = parseInt(overlayCanvas.style.top) || 0;
+      div.style.left = (canvasLeft + maxX - 4) + 'px';
+      div.style.top = (canvasTop + minY + 4) + 'px';
+
+      cameraView.appendChild(div);
+    });
   }
 
   // ── Zone list sidebar ───────────────────────────────────────────────────

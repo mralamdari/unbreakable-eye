@@ -18,6 +18,7 @@
       <div class="card-body">
         <p><strong>ID:</strong> {{ cam.id }}</p>
         <p><strong>URL:</strong> {{ cam.url }}</p>
+        <a href="/camera/{{ cam.id }}" class="button" style="margin-right:8px;">Zones</a>
         <form method="post" action="/delete-camera/{{ cam.id }}" style="display:inline;">
           <button type="submit" class="button button-danger">Delete</button>
         </form>

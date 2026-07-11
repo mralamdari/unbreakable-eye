@@ -806,6 +806,24 @@ async def delete_camera(cam_id: int, request: Request):
 # ─────────────────────────────────────────────────────────────────────────────
 # Video feed
 # ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/frame/{cam_id}")
+async def single_frame(cam_id: int, request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    processor = processors.get(cam_id)
+    if processor is None or not processor.has_frame.value:
+        return Response(content=_OFFLINE_JPEG, media_type="image/jpeg")
+
+    frame = processor.get_latest_frame()
+    ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ret:
+        return Response(content=_OFFLINE_JPEG, media_type="image/jpeg")
+
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+
 @app.get("/video_feed/{cam_id}")
 async def video_feed(cam_id: int, request: Request):
     uid = get_current_user(request)
@@ -916,6 +934,44 @@ async def monitor(request: Request):
         "cameras": cam_list,
         "logged_in": True,
         "pipelines_running": pipelines_running,
+    }, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/camera/{cam_id}", response_class=HTMLResponse)
+async def camera_detail(cam_id: int, request: Request):
+    uid = get_current_user(request)
+    if uid is None:
+        resp = RedirectResponse(url="/", status_code=302)
+        flash_message(resp, "You need to log in first.", "danger")
+        return resp
+
+    def _fetch():
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name FROM cameras WHERE id = %s AND user_id = %s",
+                    (cam_id, uid),
+                )
+                return cur.fetchone()
+
+    cam = await run_db(_fetch)
+    if cam is None:
+        resp = RedirectResponse(url="/monitor", status_code=302)
+        flash_message(resp, "Camera not found.", "danger")
+        return resp
+
+    def _zones():
+        from src.core.database import get_zones_for_camera
+        with get_connection() as conn:
+            return get_zones_for_camera(conn, cam_id)
+
+    zones = await run_db(_zones)
+
+    return templates.TemplateResponse("camera.html", {
+        "request": request,
+        "camera": {"id": cam["id"], "name": cam["name"]},
+        "zones": zones,
+        "logged_in": True,
     }, headers={"Cache-Control": "no-store"})
 
 

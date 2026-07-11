@@ -1,6 +1,7 @@
 /**
  * Zone overlay display for the monitor/video wall page.
  * Read-only — fetches zones per camera and renders polygon overlays on each tile.
+ * Zone labels are HTML elements (not canvas) so they scale crisply on zoom.
  */
 
 (function () {
@@ -11,13 +12,13 @@
     return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
   }
 
-  function drawZonesOnCanvas(canvas, zones) {
+  function drawPolygonsOnCanvas(canvas, zones) {
     var ctx = canvas.getContext('2d');
     var w = canvas.width;
     var h = canvas.height;
     ctx.clearRect(0, 0, w, h);
 
-    zones.forEach(function (zone, idx) {
+    zones.forEach(function (zone) {
       var poly = zone.polygon;
       if (!poly || poly.length < 3) return;
       var color = zone.color || '#4f8cff';
@@ -36,22 +37,46 @@
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.stroke();
+    });
+  }
 
-      // Zone number badge at first vertex (top-left corner)
-      var cx = poly[0][0] * w;
-      var cy = poly[0][1] * h;
-      var label = String(idx + 1);
+  var LABEL_VERTICAL_OFFSET = 6;
 
-      ctx.beginPath();
-      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
+  function getZoneTopRight(zone, w, h) {
+    var poly = zone.polygon;
+    var maxX = -Infinity, minY = Infinity;
+    poly.forEach(function (p) {
+      if (p[0] * w > maxX) maxX = p[0] * w;
+      if (p[1] * h < minY) minY = p[1] * h;
+    });
+    return { x: maxX, y: minY };
+  }
 
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, cx, cy);
+  function createLabelElements(tile, zones) {
+    // Remove old labels
+    tile.querySelectorAll('.zone-label').forEach(function (el) { el.remove(); });
+
+    zones.forEach(function (zone, idx) {
+      var div = document.createElement('div');
+      div.className = 'zone-label';
+      div.textContent = zone.name || 'Zone ' + (idx + 1);
+      div.style.backgroundColor = zone.color || '#4f8cff';
+      tile.appendChild(div);
+    });
+  }
+
+  function positionLabels(tile, zones, canvasW, canvasH) {
+    var labels = tile.querySelectorAll('.zone-label');
+    var canvas = tile.querySelector('.zone-overlay');
+    var canvasLeft = parseInt(canvas.style.left) || 0;
+    var canvasTop = parseInt(canvas.style.top) || 0;
+
+    labels.forEach(function (label, idx) {
+      var zone = zones[idx];
+      if (!zone) return;
+      var pos = getZoneTopRight(zone, canvasW, canvasH);
+      label.style.left = (canvasLeft + pos.x - 4) + 'px';
+      label.style.top = (canvasTop + pos.y + 4) + 'px';
     });
   }
 
@@ -61,8 +86,38 @@
     var w = img.clientWidth;
     var h = img.clientHeight;
     if (!w || !h) return false;
-    canvas.width = w;
-    canvas.height = h;
+
+    // Account for object-fit: contain letterboxing when zoomed
+    var isZoomed = tile.classList.contains('zoom');
+    if (isZoomed) {
+      var imgW = img.naturalWidth || w;
+      var imgH = img.naturalHeight || h;
+      var imgRatio = imgW / imgH;
+      var containerRatio = w / h;
+      var visibleW, visibleH, offsetX, offsetY;
+
+      if (imgRatio > containerRatio) {
+        visibleW = w;
+        visibleH = w / imgRatio;
+        offsetX = 0;
+        offsetY = (h - visibleH) / 2;
+      } else {
+        visibleH = h;
+        visibleW = h * imgRatio;
+        offsetX = (w - visibleW) / 2;
+        offsetY = 0;
+      }
+
+      canvas.width = Math.round(visibleW);
+      canvas.height = Math.round(visibleH);
+      canvas.style.left = Math.round(offsetX) + 'px';
+      canvas.style.top = Math.round(offsetY) + 'px';
+    } else {
+      canvas.width = w;
+      canvas.height = h;
+      canvas.style.left = '0px';
+      canvas.style.top = '0px';
+    }
     return true;
   }
 
@@ -79,16 +134,36 @@
           var zones = data.zones || [];
           if (zones.length === 0) return;
 
-          if (sizeCanvasToTile(canvas, tile)) {
-            drawZonesOnCanvas(canvas, zones);
+          createLabelElements(tile, zones);
+
+          function render() {
+            if (sizeCanvasToTile(canvas, tile)) {
+              drawPolygonsOnCanvas(canvas, zones);
+              positionLabels(tile, zones, canvas.width, canvas.height);
+            }
           }
 
-          // Re-render on resize
-          window.addEventListener('resize', function () {
-            if (sizeCanvasToTile(canvas, tile)) {
-              drawZonesOnCanvas(canvas, zones);
-            }
+          render();
+          window.addEventListener('resize', render);
+
+          // Re-render when zoom class changes
+          var observer = new MutationObserver(function (mutations) {
+            mutations.forEach(function (mutation) {
+              if (mutation.attributeName === 'class') {
+                render();
+              }
+            });
           });
+          observer.observe(tile, { attributes: true, attributeFilter: ['class'] });
+
+          // Also render when image loads (handles async image loading)
+          var img = tile.querySelector('img');
+          if (img) {
+            img.addEventListener('load', render);
+            if (img.complete) {
+              render();
+            }
+          }
         })
         .catch(function () {});
     });

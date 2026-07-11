@@ -52,7 +52,7 @@ body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, 
 .card-title { font-weight:600; margin-bottom:6px; }
 .grid { display:grid; gap:8px; grid-template-columns:repeat(3, 1fr); }
 .tile { background:var(--card); border:1px solid #222; border-radius:10px; min-height:200px; position:relative; overflow:hidden; cursor:pointer; }
-.tile-header { position:absolute; top:8px; left:8px; display:flex; gap:8px; align-items:center; }
+.tile-header { position:absolute; top:8px; left:8px; display:flex; gap:8px; align-items:center; z-index: 5; }
 .badge { background:#333; color:#ddd; padding:4px 8px; border-radius:999px; font-size:12px; }
 .name { font-weight:600; }
 
@@ -120,6 +120,18 @@ html, body {
   height: 100%;
   pointer-events: none;
   z-index: 2;
+}
+
+.zone-label {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: #fff;
+  font: bold 11px/1.4 sans-serif;
+  white-space: nowrap;
+  transform: translateX(-100%);
 }
 
 /* --- Zoomed state: big first row + thumbnails row --- */

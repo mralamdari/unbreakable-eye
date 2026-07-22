@@ -1,0 +1,8 @@
+# ── Optional detector backends ────────────────────────────────────────────────
+# Install ONLY what your deployment actually needs.
+
+# If MODEL_ARCH=ultralytics (PyTorch native detector):
+# pip install ultralytics==8.3.244
+
+# If MODEL_ARCH=openvino (Intel CPU/iGPU acceleration):
+# pip install openvino==2023.3.0

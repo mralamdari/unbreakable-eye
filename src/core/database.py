@@ -349,6 +349,24 @@ def init_db() -> None:
                 ON analytics_hourly (camera_id, hour_bucket)
             """)
 
+            # Upgrade FK constraints to ON DELETE CASCADE for proper camera deletion
+            # These ALTER TABLE statements are safe to run on every startup
+            _cascade_fks = [
+                ("detections", "detections_camera_id_fkey"),
+                ("zone_events", "zone_events_camera_id_fkey"),
+                ("analytics_hourly", "analytics_hourly_camera_id_fkey"),
+                ("detection_events", "detection_events_camera_id_fkey"),
+            ]
+            for table, fk_name in _cascade_fks:
+                try:
+                    cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {fk_name}")
+                    cur.execute(
+                        f"ALTER TABLE {table} ADD CONSTRAINT {fk_name} "
+                        f"FOREIGN KEY (camera_id) REFERENCES cameras(id) ON DELETE CASCADE"
+                    )
+                except Exception:
+                    pass  # constraint may not exist yet or naming differs
+
     logger.info("Database schema initialised (PostgreSQL + pgvector)")
 
 
@@ -883,4 +901,140 @@ def min_distance_to_customer(
             (emb_list, customer_id),
         )
         row = cur.fetchone()
-    return float(row["min_dist"]) if row and row["min_dist"] is not None else float("inf")    
+    return float(row["min_dist"]) if row and row["min_dist"] is not None else float("inf")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram report helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_summary_report(conn, camera_id: int) -> dict:
+    """Build summary dict for Telegram daily/weekly reports."""
+    import time as _time
+    from datetime import datetime
+    now = _time.time()
+    # Use LOCAL timezone for "today" boundary, not UTC
+    local_now = datetime.now()
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = local_midnight.timestamp()
+    week_start = today_start - 7 * 86400
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COALESCE(SUM(unique_visitors), 0) AS visitors,
+                   COALESCE(SUM(total_detections), 0) AS detections
+            FROM analytics_hourly
+            WHERE camera_id = %s AND hour_bucket >= %s
+        """, (camera_id, today_start))
+        today = dict(cur.fetchone())
+
+        # Fallback: if analytics_hourly has no today data, count from detection_events
+        if today["visitors"] == 0:
+            cur.execute("""
+                SELECT COUNT(DISTINCT tracker_id) AS visitors,
+                       COUNT(*) AS detections
+                FROM detection_events
+                WHERE camera_id = %s AND timestamp >= %s
+            """, (camera_id, today_start))
+            fallback = dict(cur.fetchone())
+            if fallback["visitors"] > 0:
+                today = fallback
+
+        cur.execute("""
+            SELECT COUNT(DISTINCT tracker_id) AS cnt
+            FROM detection_events
+            WHERE camera_id = %s AND timestamp > %s
+        """, (camera_id, now - 300))
+        active_now = cur.fetchone()["cnt"]
+
+        cur.execute("""
+            SELECT COALESCE(SUM(unique_visitors), 0) AS visitors,
+                   COALESCE(SUM(total_detections), 0) AS detections,
+                   COALESCE(AVG(avg_dwell_secs), 0) AS avg_dwell,
+                   COALESCE(MAX(peak_occupancy), 0) AS max_occupancy
+            FROM analytics_hourly
+            WHERE camera_id = %s AND hour_bucket >= %s
+        """, (camera_id, week_start))
+        week = dict(cur.fetchone())
+
+    return {
+        "today": today,
+        "week": week,
+        "active_now": active_now,
+        "zones": get_zone_stats(conn, camera_id),
+        "peak_hours": get_peak_hours(conn, camera_id),
+    }
+
+
+def get_all_cameras(conn) -> list:
+    """Return all cameras with IDs and names."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM cameras ORDER BY id")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_multi_camera_summary(conn) -> dict:
+    """Build per-camera + totals summary for Telegram reports.
+
+    Returns:
+        {
+            "cameras": [{"id", "name", "today", "week", "active_now", "zones"}, ...],
+            "totals": {"today": {...}, "week": {...}, "active_now": int}
+        }
+    """
+    cameras = get_all_cameras(conn)
+    if not cameras:
+        return {"cameras": [], "totals": {"today": {}, "week": {}, "active_now": 0}}
+
+    result_cameras = []
+    totals_today = {"visitors": 0, "detections": 0}
+    totals_week = {"visitors": 0, "detections": 0, "avg_dwell": 0, "max_occupancy": 0}
+    total_active = 0
+    week_count = 0
+
+    for cam in cameras:
+        summary = get_summary_report(conn, cam["id"])
+        result_cameras.append({
+            "id": cam["id"],
+            "name": cam["name"],
+            "today": summary.get("today", {}),
+            "week": summary.get("week", {}),
+            "active_now": summary.get("active_now", 0),
+            "zones": summary.get("zones", []),
+        })
+        totals_today["visitors"] += summary.get("today", {}).get("visitors", 0) or 0
+        totals_today["detections"] += summary.get("today", {}).get("detections", 0) or 0
+        totals_week["visitors"] += summary.get("week", {}).get("visitors", 0) or 0
+        totals_week["detections"] += summary.get("week", {}).get("detections", 0) or 0
+        totals_week["max_occupancy"] = max(
+            totals_week["max_occupancy"],
+            summary.get("week", {}).get("max_occupancy", 0) or 0,
+        )
+        avg_d = summary.get("week", {}).get("avg_dwell", 0) or 0
+        if avg_d > 0:
+            totals_week["avg_dwell"] += avg_d
+            week_count += 1
+        total_active += summary.get("active_now", 0) or 0
+
+    if week_count > 0:
+        totals_week["avg_dwell"] = totals_week["avg_dwell"] / week_count
+
+    return {
+        "cameras": result_cameras,
+        "totals": {"today": totals_today, "week": totals_week, "active_now": total_active},
+    }
+
+
+def get_heatmap_history(conn, camera_id: int, hours: int = 24) -> list:
+    """Get detection center points for heatmap generation."""
+    import time as _time
+    cutoff = _time.time() - hours * 3600
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT center_x, center_y, COUNT(*) AS weight
+            FROM detection_events
+            WHERE camera_id = %s AND timestamp > %s
+              AND center_x IS NOT NULL AND center_y IS NOT NULL
+            GROUP BY center_x, center_y
+        """, (camera_id, cutoff))
+        return [dict(r) for r in cur.fetchall()]    

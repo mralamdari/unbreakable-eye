@@ -1,0 +1,8 @@
+name = "unbreakable-eye-telegram"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Secrets (set via: npx wrangler secret put <NAME>)
+#   TELEGRAM_BOT_TOKEN - Your bot token from @BotFather
+#   ALLOWED_TOKENS     - Comma-separated secret tokens for auth
+#   DEFAULT_CHAT_ID    - Your Telegram chat ID

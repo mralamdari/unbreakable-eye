@@ -1,0 +1,12 @@
+# ── GPU acceleration (NVIDIA CUDA only) ──────────────────────────────────────
+# Use this INSTEAD of onnxruntime in requirements.txt on NVIDIA hardware.
+# Do NOT install both onnxruntime and onnxruntime-gpu — they conflict.
+#
+# Usage:
+#   pip install -r requirements.txt -r requirements-gpu.txt
+#
+# In docker-compose.yml use the gpu service variant:
+#   docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up
+
+# Replace onnxruntime with GPU version
+onnxruntime-gpu==1.23.2

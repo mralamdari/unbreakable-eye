@@ -14,6 +14,7 @@ All blocking DB calls are offloaded via run_db() to avoid blocking the event loo
 import os
 import cv2
 import json
+import time
 import asyncio
 import uvicorn
 from loguru import logger
@@ -130,6 +131,8 @@ cameras_dirty     = False  # True when DB camera list changed since last apply
 _pipelines_booted = False  # set True once apply_changes has run since process start
 analytics_queue       = None
 analytics_writer_proc = None
+alert_queue           = None
+telegram_proc         = None
 
 # Shared embedding worker state
 embed_input_queue = None   # mp.Queue: all cameras send crops here
@@ -237,6 +240,7 @@ def create_pipeline(stream_url: str, cam_id: int) -> VisionPipeline:
         response_queue=response_queue,
         frame_ready_queue=frame_ready_queue,
         analytics_queue=analytics_queue,
+        alert_queue=alert_queue,
         embed_input_queue=embed_input_queue,
         embed_output_queue=embed_output_queues[cam_id],
     )
@@ -397,12 +401,14 @@ async def apply_changes(user_cameras: list) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global CTX, db_queue, db_writer_proc, frame_ready_queue, global_stop_event, batched_det_proc
+    global alert_queue, telegram_proc
 
     CTX               = mp.get_context("spawn")
     global_stop_event = CTX.Event()
     db_queue          = CTX.Queue(maxsize=1024)
     frame_ready_queue = CTX.Queue(maxsize=64)
     analytics_queue   = CTX.Queue(maxsize=2048)
+    alert_queue       = CTX.Queue(maxsize=256)
 
     init_db()
 
@@ -416,6 +422,10 @@ async def lifespan(app: FastAPI):
     # Analytics writer — batches detection events, runs retention cleanup
     from src.core.analytics_writer import start_analytics_writer
     analytics_writer_proc = start_analytics_writer(CTX, analytics_queue)
+
+    # Telegram bot — sends alerts and reports
+    from src.telegram.bot import start_telegram_bot
+    telegram_proc = start_telegram_bot(CTX, alert_queue)
 
     logger.info("App ready — pipelines will start automatically on login")
 
@@ -445,6 +455,12 @@ async def lifespan(app: FastAPI):
         try:
             analytics_queue.put("SHUTDOWN", timeout=2)
             analytics_writer_proc.join(timeout=5)
+        except Exception:
+            pass
+    if telegram_proc is not None:                     # 5. telegram bot
+        try:
+            telegram_proc.terminate()
+            telegram_proc.join(timeout=5)
         except Exception:
             pass
 
@@ -774,6 +790,12 @@ async def delete_camera(cam_id: int, request: Request):
                 )
                 if not cur.fetchone():
                     return False
+                # Clean all related data before deleting the camera
+                cur.execute("DELETE FROM detection_events WHERE camera_id = %s", (cam_id,))
+                cur.execute("DELETE FROM analytics_hourly WHERE camera_id = %s", (cam_id,))
+                cur.execute("DELETE FROM zone_events WHERE camera_id = %s", (cam_id,))
+                cur.execute("DELETE FROM zones WHERE camera_id = %s", (cam_id,))
+                cur.execute("DELETE FROM embeddings WHERE camera_id = %s", (cam_id,))
                 cur.execute("DELETE FROM detections WHERE camera_id = %s", (cam_id,))
                 cur.execute(
                     "DELETE FROM cameras WHERE id = %s AND user_id = %s",
@@ -1348,6 +1370,88 @@ async def delete_zone_endpoint(zone_id: int, request: Request):
     if not deleted:
         raise HTTPException(status_code=404, detail="Zone not found")
     return {"deleted": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test endpoints for debugging alerts and reports
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/api/test-alert")
+async def test_alert(request: Request):
+    """Send a test alert to Telegram for debugging."""
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if alert_queue is None:
+        raise HTTPException(status_code=500, detail="Alert queue not initialized")
+
+    alert = {
+        "type": "loitering",
+        "severity": "WARNING",
+        "message": "TEST ALERT: This is a test loitering alert from Unbreakable Eye",
+        "camera_id": 1,
+        "tracker_id": 0,
+        "customer_id": None,
+        "timestamp": time.time(),
+    }
+
+    results = {}
+
+    # 1. Send via queue (for bot worker to pick up)
+    try:
+        alert_queue.put_nowait(alert)
+        logger.info("Test alert sent to queue")
+        results["queue"] = "ok"
+    except Exception as e:
+        logger.error(f"Failed to enqueue test alert: {e}")
+        results["queue"] = f"error: {e}"
+
+    # 2. Send directly via HTTP (fallback if bot worker isn't running)
+    from src.telegram.bot import send_to_telegram, _is_valid_telegram_url
+    from src.telegram.config import telegram_config
+    text = "⚠️ *WARNING*\n\nTEST ALERT: This is a test loitering alert from Unbreakable Eye"
+    buttons = []
+    if _is_valid_telegram_url(telegram_config.camera_url):
+        buttons = [[{"text": "View Camera", "url": telegram_config.camera_url}]]
+    direct_ok = send_to_telegram(text, buttons=buttons)
+    results["direct"] = "ok" if direct_ok else "failed — check TELEGRAM/CLOUDFLARE config"
+
+    if not direct_ok and results["queue"] == "ok":
+        logger.warning("Test alert queued but direct send failed — bot worker must be running")
+
+    return {"status": "Test alert sent", "results": results}
+
+
+@app.post("/api/test-report")
+async def test_report(request: Request, report_type: str = "daily"):
+    """Send a test report to Telegram for debugging."""
+    uid = get_current_user(request)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    from src.telegram.bot import _get_summary_report, send_to_telegram
+    from src.telegram.reports import format_daily_report, format_weekly_report
+
+    try:
+        summary = _get_summary_report()
+        if report_type == "weekly":
+            text = format_weekly_report(summary)
+        else:
+            text = format_daily_report(summary)
+
+        success = send_to_telegram(text)
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send — check TELEGRAM_BOT_TOKEN, CLOUDFLARE_WORKER_URL, and WORKER_SECRET in .env",
+            )
+        logger.info(f"Test {report_type} report sent successfully")
+        return {"status": "Report sent", "report_type": report_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send test report: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to send report: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

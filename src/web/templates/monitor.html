@@ -67,5 +67,53 @@ function zoomExclusive(clickedTile) {
   check();
 })();
 </script>
+
+{# ── Debug Panel (for testing alerts and reports) ─────────────────────────── #}
+<div class="debug-panel" style="position: fixed; bottom: 20px; right: 20px; z-index: 1000; background: #1a1a2e; padding: 15px; border-radius: 10px; border: 1px solid #333;">
+  <div style="color: #888; font-size: 12px; margin-bottom: 10px;">Debug Tools</div>
+  <button onclick="testAlert()" style="margin: 5px; padding: 8px 12px; background: #ff6b6b; color: white; border: none; border-radius: 5px; cursor: pointer;">Test Alert</button>
+  <button onclick="testReport('daily')" style="margin: 5px; padding: 8px 12px; background: #4ecdc4; color: white; border: none; border-radius: 5px; cursor: pointer;">Daily Report</button>
+  <button onclick="testReport('weekly')" style="margin: 5px; padding: 8px 12px; background: #45b7d1; color: white; border: none; border-radius: 5px; cursor: pointer;">Weekly Report</button>
+  <div id="debug-status" style="color: #888; font-size: 11px; margin-top: 10px;"></div>
+</div>
+
+<script>
+function showStatus(msg, isError) {
+  var el = document.getElementById('debug-status');
+  el.textContent = msg;
+  el.style.color = isError ? '#ff6b6b' : '#4ecdc4';
+  setTimeout(function() { el.textContent = ''; }, 5000);
+}
+
+async function testAlert() {
+  try {
+    showStatus('Sending test alert...', false);
+    var res = await fetch('/api/test-alert', { method: 'POST' });
+    var data = await res.json();
+    if (res.ok) {
+      showStatus('Alert sent! Check Telegram.', false);
+    } else {
+      showStatus('Error: ' + (data.detail || 'Unknown error'), true);
+    }
+  } catch (e) {
+    showStatus('Network error: ' + e.message, true);
+  }
+}
+
+async function testReport(type) {
+  try {
+    showStatus('Sending ' + type + ' report...', false);
+    var res = await fetch('/api/test-report?report_type=' + type, { method: 'POST' });
+    var data = await res.json();
+    if (res.ok) {
+      showStatus('Report sent! Check Telegram.', false);
+    } else {
+      showStatus('Error: ' + (data.detail || 'Unknown error'), true);
+    }
+  } catch (e) {
+    showStatus('Network error: ' + e.message, true);
+  }
+}
+</script>
 <script src="/static/monitor-zones.js?t=1"></script>
 {% endblock %}

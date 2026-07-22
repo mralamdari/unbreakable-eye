@@ -153,6 +153,7 @@ class VisionPipeline:
                 db_queue,
                 response_queue,
                 analytics_queue=None,
+                alert_queue=None,
                 embed_input_queue=None,
                 embed_output_queue=None,
                 buffer_slots=4):
@@ -248,6 +249,7 @@ class VisionPipeline:
         self.db_queue   = db_queue
         self.response_queue = response_queue
         self.analytics_queue = analytics_queue
+        self.alert_queue = alert_queue
         self.buffer_slots = buffer_slots
 
         # Inference resolution — input ring shared with the detector
@@ -340,6 +342,7 @@ class VisionPipeline:
                 self.cam_id,
                 self.has_frame,
                 self.analytics_queue,
+                self.alert_queue,
                 self.embed_input_queue,
                 self.embed_output_queue,
             ),
@@ -362,6 +365,7 @@ class VisionPipeline:
                 self.det_queue,
                 self.stop_event,
                 self.has_frame,
+                self.alert_queue,
             ),
             daemon=True
         )
@@ -597,6 +601,9 @@ def process_frame(
     blur_annotator=None,
     heatmap_accumulator=None,
     analytics_queue=None,
+    zone_ids=None,
+    alert_queue=None,
+    alert_limiter=None,
     precomputed_embeddings=None,
     precomputed_crop_meta=None,
 ):
@@ -645,7 +652,7 @@ def process_frame(
                 if analytics_queue is not None:
                     try:
                         analytics_queue.put_nowait(("zone_event", {
-                            "zone_id": zone_idx,
+                            "zone_id": zone_ids[zone_idx] if zone_ids and zone_idx < len(zone_ids) else zone_idx,
                             "camera_id": cam_id,
                             "tracker_id": int(tid),
                             "customer_id": track_to_customer.get(tid),
@@ -663,7 +670,7 @@ def process_frame(
                 if analytics_queue is not None:
                     try:
                         analytics_queue.put_nowait(("zone_event", {
-                            "zone_id": zone_idx,
+                            "zone_id": zone_ids[zone_idx] if zone_ids and zone_idx < len(zone_ids) else zone_idx,
                             "camera_id": cam_id,
                             "tracker_id": int(tid),
                             "customer_id": track_to_customer.get(tid),
@@ -732,6 +739,15 @@ def process_frame(
 
         if check_loitering(tracker_id, time.time(), center_point, track_positions):
             loitering_tracker_ids.add(tracker_id)
+            # Emit loitering alert
+            if alert_queue is not None and alert_limiter is not None:
+                from src.engine.alerts import emit_loitering_alert
+                duration = time.time() - track_positions[tracker_id][0][0]
+                emit_loitering_alert(
+                    alert_queue, cam_id, tracker_id,
+                    track_to_customer.get(tracker_id),
+                    duration, alert_limiter,
+                )
 
         if run_embedding:
             input_tensor, crop_box, center_point, bbox_w, bbox_h, crop_flag = preprocess_crop(
@@ -946,7 +962,8 @@ def reader_worker(rtsp_url,
                   frame_ready_queue,
                   det_queue,
                   stop_event,
-                  has_frame):
+                  has_frame,
+                  alert_queue=None):
     pin_process([0])
     shm = shared_memory.SharedMemory(name=shm_name)
     native_shm = shared_memory.SharedMemory(name=native_shm_name)
@@ -1016,6 +1033,11 @@ def reader_worker(rtsp_url,
             logger.warning(f"Camera {cam_id}: stream frozen for {FREEZE_TIMEOUT}s, reconnecting")
             online = False
             consecutive_failures += 1
+            # Emit camera offline alert
+            if consecutive_failures == 3 and alert_queue is not None:
+                from src.engine.alerts import AlertRateLimiter, emit_camera_offline_alert
+                _offline_limiter = AlertRateLimiter(cooldown_seconds=300)
+                emit_camera_offline_alert(alert_queue, cam_id, 15, _offline_limiter)
             try:
                 det_queue.put_nowait((None, None, None, None))
             except queue.Full:
@@ -1083,6 +1105,7 @@ def embedder_worker(
     cam_id,
     has_frame,
     analytics_queue=None,
+    alert_queue=None,
     embed_input_queue=None,
     embed_output_queue=None,
 ):
@@ -1153,18 +1176,26 @@ def embedder_worker(
     # Using frame_shape (512×512) here caused zones and box annotations to
     # appear only in the top-left corner of the 1920×1080 output frame.
     dh, dw, _ = display_shape
-    polygons = [
-        np.array([
-            [0,   0  ],
-            [dw,  0  ],
-            [dw,  dh ],
-            [0,   dh ],
-        ], dtype=np.int32)
-    ]
 
+    # Load zones from database
+    from src.engine.zones import ZoneManager
+    from src.core.database import get_connection
+    zone_mgr = ZoneManager()
+    with get_connection() as conn:
+        db_zones = zone_mgr.load_from_db(conn, cam_id)
+    zone_mgr.init_zones_for_camera(cam_id, dw, dh)
 
-    zones = [sv.PolygonZone(polygon=polygon) for polygon in polygons]
-    
+    if db_zones:
+        zones = [z._sv_zone for z in db_zones if z._sv_zone is not None]
+        zone_ids = [z.zone_id for z in db_zones if z._sv_zone is not None]
+        logger.info(f"Loaded {len(zones)} zones for camera {cam_id}")
+    else:
+        # Fallback: full-frame polygon (current behavior)
+        polygons = [np.array([[0,0],[dw,0],[dw,dh],[0,dh]], dtype=np.int32)]
+        zones = [sv.PolygonZone(polygon=polygon) for polygon in polygons]
+        zone_ids = [0]
+        logger.info(f"No zones for camera {cam_id}, using full-frame fallback")
+
     zone_annotators = [
         sv.PolygonZoneAnnotator(
             zone=zone,
@@ -1173,13 +1204,22 @@ def embedder_worker(
             text_thickness=2,
             text_scale=1
         ) for index, zone in enumerate(zones)]
-     
+
     zone_box_annotators = [
         sv.BoxAnnotator(
             color=colors.by_idx(index),
             thickness=1,
-        ) for index in range(len(polygons))]
-    
+        ) for index in range(len(zones))]
+
+    # Zone reload tracking
+    last_zone_reload = time.time()
+    ZONE_RELOAD_INTERVAL = 30  # seconds
+    _frame_count = 0
+
+    # Alert rate limiter
+    from src.engine.alerts import AlertRateLimiter
+    alert_limiter = AlertRateLimiter(cooldown_seconds=300)
+
     # dwell time tracking
     dwell_start = {}   # tracker_id -> enter_time
     dwell_total = defaultdict(float)  # tracker_id -> total accumulated seconds
@@ -1310,6 +1350,9 @@ def embedder_worker(
             blur_annotator=blur_annotator,
             heatmap_accumulator=heatmap_accumulator,
             analytics_queue=analytics_queue,
+            zone_ids=zone_ids,
+            alert_queue=alert_queue,
+            alert_limiter=alert_limiter,
             precomputed_embeddings=precomputed_embeddings,
             precomputed_crop_meta=precomputed_crop_meta,
         )
@@ -1324,6 +1367,39 @@ def embedder_worker(
         if not has_frame.value:
             has_frame.value = 1
 
+        # Periodic zone reload (every 30 seconds)
+        _frame_count += 1
+        if _frame_count % 300 == 0:  # ~300 frames at 10fps = 30 seconds
+            now = time.time()
+            if now - last_zone_reload > ZONE_RELOAD_INTERVAL:
+                try:
+                    with get_connection() as conn:
+                        new_db_zones = zone_mgr.load_from_db(conn, cam_id)
+                    zone_mgr.init_zones_for_camera(cam_id, dw, dh)
+                    new_zones = [z._sv_zone for z in new_db_zones if z._sv_zone is not None]
+                    new_zone_ids = [z.zone_id for z in new_db_zones if z._sv_zone is not None]
+                    if new_zone_ids != zone_ids:
+                        zones = new_zones
+                        zone_ids = new_zone_ids
+                        # Recreate annotators
+                        zone_annotators = [
+                            sv.PolygonZoneAnnotator(
+                                zone=zone,
+                                color=colors.by_idx(index),
+                                thickness=1,
+                                text_thickness=2,
+                                text_scale=1
+                            ) for index, zone in enumerate(zones)]
+                        zone_box_annotators = [
+                            sv.BoxAnnotator(
+                                color=colors.by_idx(index),
+                                thickness=1,
+                            ) for index in range(len(zones))]
+                        logger.info(f"Reloaded {len(zones)} zones for camera {cam_id}")
+                except Exception as e:
+                    logger.error(f"Zone reload failed for camera {cam_id}: {e}")
+                last_zone_reload = now
+
     input_shm.close()
     native_shm.close()
     output_shm.close()
@@ -1336,7 +1412,7 @@ def batched_detector_worker(
     frame_shape,         # (H, W, C) — same for all cameras
     frame_bytes,         # int
     stop_event,
-    batch_timeout=0.02,  # seconds to wait collecting a full batch
+    batch_timeout=0.15,  # 150ms — enough for 3 unsynchronized RTSP cameras
 ):
     """
     Single process that owns ONE YOLO session.
@@ -1357,7 +1433,7 @@ def batched_detector_worker(
     # the lifetime of this process.
     n_cams     = len(shm_blocks)
     detector   = get_detector()   # one YOLO session for ALL cameras
-    max_batch  = min(n_cams, 2)   # cap at 2 to avoid ONNX segfaults with 3+ cams
+    max_batch  = min(n_cams, int(os.getenv("MAX_BATCH_SIZE", "8")))
 
     while not stop_event.is_set():
 

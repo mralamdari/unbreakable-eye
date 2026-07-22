@@ -8,7 +8,6 @@ __pycache__/
 
 # Environment
 .env
-*.env
 env/
 venv/
 .venv/
@@ -16,48 +15,40 @@ venv/
 .ruff_cache/
 .hf_cache/
 
-# Configuration (Secrets)
-config.yaml
+# IDE and editor
+.vscode/
+.idea/
+
+# Testing and type checking
+.pytest_cache/
+.mypy_cache/
+.coverage
+.ruff_cache/
 
 # Model weights — never commit binary model files
-# Data & Models (Too big for Git)
 models/**/*.onnx
 models/**/*.pt
 models/**/*.pth
 models/**/*.bin
 models/
+
+# Data and logs
 data/
 logs/
 
-
-# IDEs
-.vscode/
-.idea/
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-.coverage
-
-# Data and debug artifacts
-data/
-logs/
-*.txt
-
-
-# OS
-.DS_Store
-Thumbs.db
-
-
-# --- IGNORE DATA --- 
-data/
+# Media and archives
 *.mp4
 *.avi
 *.jpg
 *.png
 *.zip
 
-# Database
-data/db/*.db
-data/db/*.sqlite3
+# Node / Cloudflare Worker
+cloudflare-worker/node_modules/
+
+# Editor artifacts
+.mimocode/
+
+# OS
+.DS_Store
+Thumbs.db

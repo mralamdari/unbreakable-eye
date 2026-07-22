@@ -1,0 +1,19 @@
+# ── Development dependencies ──────────────────────────────────────────────────
+# Never installed in production Docker image.
+# Usage: pip install -r requirements.txt -r requirements-dev.txt
+
+# Testing
+pytest==8.2.2
+pytest-asyncio==0.23.7
+pytest-timeout==2.3.1
+httpx==0.28.1
+
+# Linting / type checking
+ruff==0.4.9
+mypy==1.19.1
+types-requests==2.32.4.20250913
+
+# Model export tools (run once on dev machine, not in prod)
+onnx==1.20.0
+onnxsim==0.5.0
+tqdm==4.67.1

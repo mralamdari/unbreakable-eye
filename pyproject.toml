@@ -28,7 +28,7 @@ onnx = "^1.20.0"
 onnxslim = "^0.1.82"
 requests = "^2.32.5"
 ultralytics = "^8.1.0"       # Needed for YOLOv8
-onnxruntime = "^1.82.0"      # Needed for YOLOX/RT-DETR (CPU version)
+onnxruntime = "^1.15.0"      # Needed for YOLOX/RT-DETR (CPU version), was incorrectly ^1.82.0
 # onnxruntime-gpu = "^1.17.0" # Use THIS instead of onnxruntime if you have NVIDIA GPU
 
 # --- OPENVINO (Optional) ---
@@ -68,3 +68,7 @@ module = [
     "uvicorn.*"
 ]
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+addopts = "-v"

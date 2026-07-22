@@ -24,7 +24,6 @@ import cv2
 import supervision as sv
 from loguru import logger
 from typing import List, Tuple
-from src.core.config import settings
 from src.vision.base import BaseDetector
 from src.vision.utils import create_session, bgr_to_rgb
 from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError, PostprocessError

@@ -154,7 +154,7 @@ class TestHeatmapGetHeatmap:
         for i in range(5):
             hm.add_position(50.0, 50.0, now=base + i * 0.001)
         hm.add_position(150.0, 150.0, now=base + 0.1)
-        result = hm.get_heatmap()
+        hm.get_heatmap()
         # Center pixel of the (50,50) group should be >= the (150,150) pixel
         # (use >= because with small counts they could both be 0 after uint8 cast)
         raw_50 = hm.heatmap[50, 50]

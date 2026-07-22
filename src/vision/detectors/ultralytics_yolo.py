@@ -43,7 +43,7 @@ class UltralyticsDetector(BaseDetector):
         try:
             logger.info(f"Loading YOLO model from {model_path} on {self.device}")
             self.model = YOLO(model_path)
-            logger.info(f"YOLO model loaded successfully")
+            logger.info("YOLO model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load YOLO model: {e}")
             raise ModelLoadError(
@@ -79,7 +79,7 @@ class UltralyticsDetector(BaseDetector):
         except Exception as e:
             logger.error(f"YOLO inference failed: {e}")
             raise InferenceError(
-                f"YOLO inference failed",
+                "YOLO inference failed",
                 context={"frame_shape": frame.shape, "error": str(e)}
             ) from e
 
@@ -112,6 +112,6 @@ class UltralyticsDetector(BaseDetector):
         except Exception as e:
             logger.error(f"YOLO batch inference failed: {e}")
             raise InferenceError(
-                f"YOLO batch inference failed",
+                "YOLO batch inference failed",
                 context={"num_frames": len(frames), "error": str(e)}
             ) from e

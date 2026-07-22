@@ -4,7 +4,7 @@ Tests for the AlertRateLimiter (src/engine/alerts.py).
 Pure logic — no models, cameras, or GPU needed.
 """
 import time
-from src.engine.alerts import AlertRateLimiter, emit_loitering_alert, _emit
+from src.engine.alerts import AlertRateLimiter
 
 
 class TestAlertRateLimiter:

@@ -7,11 +7,8 @@ to inference resolution at runtime. Supports two types:
   - 'line': LineZone for entry/exit counting
 """
 
-import time
 import numpy as np
 import supervision as sv
-from loguru import logger
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -91,7 +88,6 @@ class ZoneManager:
 
     def load_from_db(self, conn, camera_id: int) -> list[Zone]:
         """Load zones for a camera from the database."""
-        import json
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, camera_id, name, polygon, zone_type, color FROM zones WHERE camera_id = %s",

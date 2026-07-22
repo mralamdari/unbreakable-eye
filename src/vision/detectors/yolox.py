@@ -20,7 +20,6 @@ import supervision as sv
 from loguru import logger
 from typing import Optional, Tuple
 
-from src.core.config import settings
 from src.vision.base import BaseDetector
 from src.vision.utils import create_session, nms_numpy
 from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError, PostprocessError

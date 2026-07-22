@@ -41,7 +41,6 @@ def _format_multi_camera_report(summary: dict, period: str = "Daily") -> str:
     for cam in cameras:
         name = cam.get("name", "Unknown")
         cam_today = cam.get("today", {})
-        cam_week = cam.get("week", {})
         cam_active = cam.get("active_now", 0)
         zones = cam.get("zones", [])
 

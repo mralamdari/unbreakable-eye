@@ -6,7 +6,6 @@ Zone.track_dwell uses pure set operations — no models, cameras, or GPU needed.
 Note: Zone.__init__ requires supervision (sv) which needs the full package,
 but we can test in isolation by creating a Zone manually with minimal setup.
 """
-import time
 import numpy as np
 from src.engine.zones import Zone, ZoneManager
 

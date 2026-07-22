@@ -13,7 +13,6 @@ import cv2
 import numpy as np
 import supervision as sv
 from loguru import logger
-from typing import Tuple
 
 from src.vision.base import BaseDetector
 from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError, PostprocessError

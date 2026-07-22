@@ -14,7 +14,6 @@ Queue contract (unchanged from SQLite version):
                                   quality_score)
 """
 
-import numpy as np
 from loguru import logger
 
 from src.core.database import (

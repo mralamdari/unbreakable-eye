@@ -25,7 +25,6 @@ Architecture decisions:
     lastrowid → cursor.fetchone()["id"] after RETURNING id.
 """
 
-import os
 import threading
 import numpy as np
 from datetime import datetime
@@ -36,6 +35,9 @@ import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 from loguru import logger
+
+from src.core.config import settings
+from src.core.exceptions import DatabaseError
 
 # pgvector type adapter for psycopg2 ─────────────────────────────────────────
 # Without this, psycopg2 returns vector columns as raw strings like
@@ -68,9 +70,6 @@ def _register_vector_type(conn) -> None:
         (oid,), "VECTOR", _parse_vector
     )
     psycopg2.extensions.register_type(vector_type, conn)
-
-from src.core.config import settings
-from src.core.exceptions import DatabaseError
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Connection Pool
@@ -248,7 +247,7 @@ def init_db() -> None:
             # HNSW index — fast approximate nearest-neighbour search at query time.
             # cosine distance (<->) is correct for L2-normalised Re-ID embeddings.
             # Build after the table exists; IF NOT EXISTS prevents duplicate creation.
-            cur.execute(f"""
+            cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_embeddings_hnsw
                 ON embeddings
                 USING hnsw (embedding vector_cosine_ops)

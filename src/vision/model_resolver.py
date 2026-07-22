@@ -14,7 +14,6 @@ Resolution order for every architecture:
 """
 
 import os
-import re
 import shutil
 import urllib.request
 from functools import lru_cache

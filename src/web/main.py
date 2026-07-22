@@ -357,7 +357,7 @@ def _startup_sync(user_cameras: list) -> None:
     batched_det_proc = _start_batched_detector()
 
     # 5. ONE shared_embedder — single OSNet session for all cameras
-    shared_embedder_proc = _start_shared_embedder()
+    _start_shared_embedder()
 
     # 6. Start all readers + embedders simultaneously
     for proc in processors.values():
@@ -1226,12 +1226,18 @@ async def analysis_dwell(request: Request, zone_id: int = None):
         buckets = {"0-10s": 0, "10-30s": 0, "30-60s": 0, "1-3min": 0, "3-10min": 0, "10min+": 0}
         for r in rows:
             d = r["dwell_seconds"]
-            if d < 10: buckets["0-10s"] += 1
-            elif d < 30: buckets["10-30s"] += 1
-            elif d < 60: buckets["30-60s"] += 1
-            elif d < 180: buckets["1-3min"] += 1
-            elif d < 600: buckets["3-10min"] += 1
-            else: buckets["10min+"] += 1
+            if d < 10:
+                buckets["0-10s"] += 1
+            elif d < 30:
+                buckets["10-30s"] += 1
+            elif d < 60:
+                buckets["30-60s"] += 1
+            elif d < 180:
+                buckets["1-3min"] += 1
+            elif d < 600:
+                buckets["3-10min"] += 1
+            else:
+                buckets["10min+"] += 1
         return buckets
 
     return await run_db(_fetch)

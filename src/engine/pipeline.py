@@ -2,7 +2,6 @@ import os
 import cv2
 import time
 import queue
-import uuid
 import psutil
 import functools
 import numpy as np
@@ -1223,7 +1222,7 @@ def embedder_worker(
     # dwell time tracking
     dwell_start = {}   # tracker_id -> enter_time
     dwell_total = defaultdict(float)  # tracker_id -> total accumulated seconds
-    last_valid_detections = sv.Detections.empty()
+    _last_valid_detections = sv.Detections.empty()
     while not stop_event.is_set():
         try:
             item = det_queue.get(timeout=0.1)
@@ -1257,12 +1256,12 @@ def embedder_worker(
             if xyxy is not None:
                 detections = sv.Detections(
                     xyxy=xyxy, confidence=confidence, class_id=class_id)
-                last_valid_detections = detections
+                _last_valid_detections = detections
                 run_embedding = True
             else:
                 # Real frame, but detector found nothing
                 detections    = sv.Detections.empty()
-                last_valid_detections = detections
+                _last_valid_detections = detections
                 run_embedding = False
 
         # Free the slot ONLY if it was a real frame — both frame and

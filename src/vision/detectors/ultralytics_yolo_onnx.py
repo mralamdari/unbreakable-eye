@@ -14,7 +14,7 @@ from src.vision.base import BaseDetector
 from src.vision.utils import (
         create_session, letterbox,
         to_chw_float32, scale_boxes)
-from src.core.exceptions import ModelLoadError, InferenceError, PreprocessError
+from src.core.exceptions import InferenceError, PreprocessError, PostprocessError
 
 
 class UltralyticsONNXDetector(BaseDetector):

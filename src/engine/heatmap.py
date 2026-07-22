@@ -14,7 +14,6 @@ configurable time window.
 import time
 import cv2
 import numpy as np
-from loguru import logger
 from src.core.config import settings
 
 

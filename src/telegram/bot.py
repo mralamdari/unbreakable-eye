@@ -6,7 +6,6 @@ No python-telegram-bot library needed — just simple HTTP requests.
 """
 
 import asyncio
-import time
 from datetime import datetime
 from loguru import logger
 import requests
@@ -15,12 +14,8 @@ from src.telegram.config import telegram_config
 from src.telegram.reports import (
     format_daily_report,
     format_weekly_report,
-    format_status_message,
-    format_zone_report,
-    format_peak_hours,
 )
-from src.telegram.heatmap import generate_heatmap_image
-from src.core.database import get_connection, write_connection
+from src.core.database import get_connection
 
 
 def _is_valid_telegram_url(url: str) -> bool:

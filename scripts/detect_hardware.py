@@ -113,7 +113,7 @@ def main():
     print(f"  Apple Silicon:{'YES' if hw['apple_si'] else 'no'}")
     print(f"  Intel GPU:    {'YES' if hw['intel_gpu'] else 'no'}")
     print()
-    print(f"=== Recommendation ===")
+    print("=== Recommendation ===")
     print(f"  {explanation}")
     print(f"  ONNX Runtime package: {pkg}")
     if extra_req:

@@ -1,7 +1,6 @@
 """Heatmap image generation for Telegram bot."""
 
 import io
-import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 

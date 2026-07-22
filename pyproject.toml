@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "unbreakable-eye"
-version = "0.2.0"
+version = "0.1.0"
 description = "Production-Grade Edge AI Inference Microservice for Real-Time Computer Vision"
 authors = ["Esmaeil F. Alamdari <mralamdari2000@gmail.com>"]
 readme = "README.md"

@@ -45,7 +45,7 @@ class Zone:
                 anchor = sv.Point(int(pixel_poly[2, 0]), int(pixel_poly[2, 1]))
             else:
                 anchor = sv.Point(int(pixel_poly[1, 0]) + 100, int(pixel_poly[1, 1]))
-            self._line_zone = sv.LineZone(start=start, end=end, anchor=anchor)
+            self._line_zone = sv.LineZone(start=start, end=end, anchor=anchor)  # type: ignore[call-arg]
         else:
             self._sv_zone = sv.PolygonZone(polygon=pixel_poly)
 

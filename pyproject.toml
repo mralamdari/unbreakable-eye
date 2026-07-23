@@ -55,7 +55,6 @@ follow_imports = "silent"
 exclude = ["venv", ".venv", "__pycache__"]
 no_implicit_optional = true
 explicit_package_bases = true
-no_site_packages = true
 
 # --- MYPY OVERRIDES: third-party libs with no stubs ---
 [[tool.mypy.overrides]]

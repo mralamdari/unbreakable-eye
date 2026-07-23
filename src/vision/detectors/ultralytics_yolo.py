@@ -70,8 +70,8 @@ class UltralyticsDetector(BaseDetector):
                 conf=self.confidence_threshold,
                 verbose=False,
                 device=self.device
-            )[0]
-            
+            )
+
             detections = sv.Detections.from_ultralytics(results)
             logger.debug(f"YOLO inference: {len(detections)} detections")
             return detections

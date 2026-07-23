@@ -13,7 +13,7 @@ from src.core.exceptions import ModelLoadError, InferenceError
 try:
     from ultralytics import YOLO
 except ImportError:
-    YOLO = None  # loaded lazily — only fails when UltralyticsDetector is instantiated
+    YOLO = None  # type: ignore[assignment,misc]  # loaded lazily — only fails when UltralyticsDetector is instantiated
 
 
 class UltralyticsDetector(BaseDetector):

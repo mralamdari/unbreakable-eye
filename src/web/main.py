@@ -707,9 +707,9 @@ async def logout():
 async def camera_page(request: Request):
     uid = get_current_user(request)
     if uid is None:
-        resp = RedirectResponse(url="/", status_code=302)
-        flash_message(resp, "You need to log in first.", "danger")
-        return resp
+        redirect = RedirectResponse(url="/", status_code=302)
+        flash_message(redirect, "You need to log in first.", "danger")
+        return redirect
 
     def _fetch():
         with get_connection() as conn:

@@ -338,7 +338,7 @@ def _download_from_hf(
             subfolder=subfolder,
             cache_dir=os.path.join(settings.BASE_DIR, "hf_cache"),
             local_dir=local_dir,
-            local_dir_use_symlinks=False,
+            local_dir_use_symlinks=False,  # type: ignore[call-overload]
         )
         logger.success(f"HF download complete → {downloaded}")
 

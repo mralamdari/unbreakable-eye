@@ -47,7 +47,7 @@ class Zone:
                 anchor = sv.Point(int(pixel_poly[1, 0]) + 100, int(pixel_poly[1, 1]))
             self._line_zone = sv.LineZone(start=start, end=end, anchor=anchor)  # type: ignore[call-arg]
         else:
-            self._sv_zone = sv.PolygonZone(polygon=pixel_poly)
+            self._sv_zone = sv.PolygonZone(polygon=pixel_poly)  # type: ignore[arg-type]
 
     def trigger(self, detections: sv.Detections) -> np.ndarray:
         """Return boolean mask of detections inside this zone."""

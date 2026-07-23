@@ -17,6 +17,7 @@ import json
 import time
 import asyncio
 import uvicorn
+from typing import Any
 from loguru import logger
 import multiprocessing as mp
 from contextlib import asynccontextmanager
@@ -114,16 +115,16 @@ async def run_db(fn, *args):
 # ─────────────────────────────────────────────────────────────────────────────
 # Global pipeline state
 # ─────────────────────────────────────────────────────────────────────────────
-processors        = {}   # cam_id -> VisionPipeline (running pipelines only)
+processors:        dict[int, Any] = {}   # cam_id -> VisionPipeline (running pipelines only)
 batched_det_proc  = None
 shared_embedder_proc = None
 frame_ready_queue = None
-det_queues        = {}
-free_slots_queues = {}
-shm_names         = {}
-response_queues   = {}
-stop_events       = {}   # cam_id -> per-camera CTX.Event
-CTX               = None
+det_queues:        dict[int, Any] = {}
+free_slots_queues: dict[int, Any] = {}
+shm_names:         dict[int, str] = {}
+response_queues    = {}
+stop_events        = {}   # cam_id -> per-camera CTX.Event
+CTX: Any          = None
 db_queue          = None
 db_writer_proc    = None
 global_stop_event = None  # signals batched_detector + final app shutdown only
@@ -1188,7 +1189,7 @@ async def analysis_occupancy(request: Request, hours: int = 24):
 
 
 @app.get("/api/analysis/dwell")
-async def analysis_dwell(request: Request, zone_id: int = None):
+async def analysis_dwell(request: Request, zone_id: int | None = None):
     uid = get_current_user(request)
     if uid is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -1293,7 +1294,7 @@ async def analysis_repeat_visitors(request: Request, days: int = 30):
 
 
 @app.get("/api/analysis/zone-stats")
-async def analysis_zone_stats(request: Request, cam_id: int = None):
+async def analysis_zone_stats(request: Request, cam_id: int | None = None):
     uid = get_current_user(request)
     if uid is None:
         raise HTTPException(status_code=401, detail="Not authenticated")

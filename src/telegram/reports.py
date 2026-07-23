@@ -118,7 +118,7 @@ def format_daily_report(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def format_weekly_report(summary: dict, comparison: dict = None) -> str:
+def format_weekly_report(summary: dict, comparison: dict | None = None) -> str:
     """Format weekly summary report as Telegram message."""
     if "cameras" in summary:
         return _format_multi_camera_report(summary, "Weekly")

@@ -39,7 +39,7 @@ class HeatmapAccumulator:
         kernel = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         return kernel / kernel.sum()
 
-    def add_position(self, cx: float, cy: float, now: float = None):
+    def add_position(self, cx: float, cy: float, now: float | None = None):
         """Add a person's center position to the heatmap."""
         if now is None:
             now = time.time()

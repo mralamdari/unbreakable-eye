@@ -9,7 +9,7 @@ from loguru import logger
 class VisionError(RuntimeError):
     """Base exception for all vision pipeline errors."""
 
-    def __init__(self, message: str, context: dict = None):
+    def __init__(self, message: str, context: dict | None = None):
         """
         Args:
             message: Error description

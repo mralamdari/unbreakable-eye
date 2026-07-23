@@ -42,7 +42,7 @@ def analytics_writer_worker(analytics_queue) -> None:
     """Main loop — batches detection events, flushes periodically."""
     from src.core.config import settings
 
-    batch = []
+    batch: list[dict] = []
     last_flush = time.time()
     last_cleanup = time.time()
     last_aggregation = time.time()

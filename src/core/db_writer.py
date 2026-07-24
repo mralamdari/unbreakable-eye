@@ -83,6 +83,7 @@ def _dispatch(typ: str, cmd: tuple, response_queues: dict) -> None:
 
     if typ == "update_customer_last_seen":
         _, customer_id, now = cmd
+        logger.debug(f"DB writer: update_customer_last_seen {customer_id}")
         with write_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -92,6 +93,7 @@ def _dispatch(typ: str, cmd: tuple, response_queues: dict) -> None:
 
     elif typ == "store_embedding":
         _, customer_id, cam_id, emb, now, center_point, bbox_w, bbox_h = cmd
+        logger.debug(f"DB writer: store_embedding for customer {customer_id}, cam {cam_id}")
         with write_connection() as conn:
             # Camera may have been deleted while its pipeline was still running
             # (between DB delete and the next apply_changes() teardown cycle).
@@ -124,6 +126,7 @@ def _dispatch(typ: str, cmd: tuple, response_queues: dict) -> None:
     elif typ == "match_or_register":
         _, emb, cam_id, now, request_id, center_point, \
             bbox_w, bbox_h, track_id, quality_score = cmd
+        logger.debug(f"DB writer: match_or_register for cam {cam_id}, tracker {track_id}")
 
         matched_cust, dist = fast_match(
             emb,

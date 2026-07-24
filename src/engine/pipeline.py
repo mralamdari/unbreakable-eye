@@ -776,6 +776,7 @@ def process_frame(
         embeddings = None
 
     if embeddings is not None and len(embeddings) > 0:
+        logger.debug(f"Embedder: {len(embeddings)} embeddings for cam {cam_id}")
         for i, emb in enumerate(embeddings):
             emb = emb.flatten()
             emb = emb / (np.linalg.norm(emb) + 1e-8)
@@ -796,11 +797,14 @@ def process_frame(
                     rid, min_dist = response_queue.get()
 
                 if min_dist > settings.DIVERSITY_THRESHOLD:
+                    logger.debug(f"Storing new embedding for customer {customer_id} (dist={min_dist:.3f})")
                     db_queue.put(("store_embedding", customer_id, cam_id, emb,
                                   time.time(), center_point, bbox_w, bbox_h))
                 else:
+                    logger.debug(f"Customer {customer_id} matched (dist={min_dist:.3f})")
                     db_queue.put(("update_customer_last_seen", customer_id, time.time()))
             else:
+                logger.debug(f"Registering new person for cam {cam_id}, tracker {tracker_id}")
                 request_id = f"match_{cam_id}_{tracker_id}_{time.time()}"
                 db_queue.put((
                     "match_or_register",

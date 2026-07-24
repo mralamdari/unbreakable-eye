@@ -42,6 +42,7 @@ def shared_embedder_worker(
     while not stop_event.is_set():
         try:
             request_id, cam_id, crops_onnx, crop_meta = embed_input_queue.get(timeout=0.1)
+            logger.debug(f"Shared embedder: received {len(crops_onnx)} crops from cam {cam_id}")
         except queue.Empty:
             continue
 
@@ -1311,6 +1312,7 @@ def embedder_worker(
                         int(tracker_id), det_conf))
 
             if crops_onnx:
+                logger.debug(f"Shared embedder: sending {len(crops_onnx)} crops for cam {cam_id}")
                 # Send crops to shared embedding worker
                 request_id = f"emb_{cam_id}_{time.time()}"
                 try:
@@ -1320,6 +1322,7 @@ def embedder_worker(
                     if result_id == request_id:
                         precomputed_embeddings = embeddings
                         precomputed_crop_meta = crop_meta
+                        logger.debug(f"Shared embedder: got {len(embeddings)} embeddings back")
                 except (queue.Empty, queue.Full) as e:
                     logger.warning(f"Shared embedder timeout/error for camera {cam_id}: {e}")
 

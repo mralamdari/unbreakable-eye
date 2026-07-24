@@ -780,9 +780,6 @@ async def delete_camera(cam_id: int, request: Request):
         return resp
 
     def _delete():
-        # write_connection() commits on success, rolls back on exception.
-        # The old code used get_connection() which never commits in PostgreSQL —
-        # that is why the deleted camera always reappeared after restart.
         with write_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -864,23 +861,10 @@ async def video_feed(cam_id: int, request: Request):
                 # that start after the initial request (background resume).
                 processor = processors.get(cam_id)
 
-                if processor is None:
-                    # Pipeline not started yet — serve offline image so the
-                    # <img> tag gets a valid MJPEG frame instead of a 404.
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        + _OFFLINE_JPEG
-                        + b"\r\n"
-                    )
-                    await asyncio.sleep(1.0)
-                    continue
-
-                # has_frame.value is set to 1 by reader_worker the first time it
-                # successfully reads a frame from the camera. Until then, serve
-                # the offline image so the tile is never black or empty.
-                # After the camera connects, switch seamlessly to the live stream.
-                if not processor.has_frame.value:
+                if processor is None or not processor.has_frame.value:
+                    # Pipeline not started or still waiting for first frame —
+                    # serve offline image so the <img> tag gets a valid
+                    # MJPEG frame instead of a 404 or a black tile.
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n"

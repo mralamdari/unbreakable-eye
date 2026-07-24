@@ -177,11 +177,7 @@ def _stop_batched_detector():
 def _start_shared_embedder() -> mp.Process:
     """Start the shared embedding worker that owns ONE OSNet session for all cameras."""
     global embed_input_queue, embed_output_queues
-    embed_input_queue = CTX.Queue(maxsize=16)
-    # Create output queues for each camera
-    for cam_id in list(processors.keys()):
-        if cam_id not in embed_output_queues:
-            embed_output_queues[cam_id] = CTX.Queue(maxsize=4)
+    # Queues must already be initialized by _startup_sync before calling this.
 
     p = CTX.Process(
         target=shared_embedder_worker,
@@ -331,6 +327,7 @@ def _teardown_sync(snapshot: dict) -> None:
 def _startup_sync(user_cameras: list) -> None:
     """Phase C — blocking, in executor thread. Rebuilds from scratch."""
     global frame_ready_queue, db_writer_proc, batched_det_proc
+    global embed_input_queue, embed_output_queues
 
     if not user_cameras:
         logger.info("No cameras configured — startup skipped")
@@ -339,9 +336,17 @@ def _startup_sync(user_cameras: list) -> None:
     # 1. Fresh frame_ready_queue — guaranteed empty, no stale items
     frame_ready_queue = CTX.Queue(maxsize=64)
 
+    # 1b. Initialize shared embedder queues BEFORE creating pipelines
+    #     so pipelines capture the queue references, not None.
+    embed_input_queue = CTX.Queue(maxsize=16)
+    embed_output_queues = {}
+
     # 2. create_pipeline() for every camera
     for cam in user_cameras:
         try:
+            # Ensure output queue exists for this camera
+            if cam["id"] not in embed_output_queues:
+                embed_output_queues[cam["id"]] = CTX.Queue(maxsize=4)
             proc = create_pipeline(cam["stream_url"], cam["id"])
             processors[cam["id"]] = proc
         except Exception as e:

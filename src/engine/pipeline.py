@@ -1267,6 +1267,9 @@ def embedder_worker(
             if xyxy is not None:
                 detections = sv.Detections(
                     xyxy=xyxy, confidence=confidence, class_id=class_id)
+                # Run ByteTrack BEFORE the shared embedder path so tracker_ids
+                # are available for Re-ID.
+                detections = tracker.update_with_detections(detections)
                 _last_valid_detections = detections
                 run_embedding = True
             else:
@@ -1299,7 +1302,6 @@ def embedder_worker(
         # Extract crops for embedding (before calling process_frame)
         precomputed_embeddings = None
         precomputed_crop_meta = None
-        print(f"DEBUG_EMBED: run_embedding={run_embedding}, in_q={embed_input_queue is not None}, out_q={embed_output_queue is not None}, dets={len(detections) if detections else 0}", flush=True)
         if run_embedding and embed_input_queue is not None and embed_output_queue is not None:
             crops_onnx = []
             crop_meta_list = []
@@ -1317,26 +1319,20 @@ def embedder_worker(
                     crop_meta_list.append((
                         crop_box, center_point, bbox_w, bbox_h,
                         int(tracker_id), det_conf))
-
             if crops_onnx:
-                print(f"DEBUG_CROP: sending {len(crops_onnx)} crops for cam {cam_id}", flush=True)
                 logger.info(f"Shared embedder: sending {len(crops_onnx)} crops for cam {cam_id}")
                 # Send crops to shared embedding worker
                 request_id = f"emb_{cam_id}_{time.time()}"
                 try:
                     embed_input_queue.put_nowait((request_id, cam_id, crops_onnx, crop_meta_list))
-                    print(f"DEBUG_PUT: put to queue OK, waiting for response...", flush=True)
                     # Wait for embeddings from shared worker
                     result_id, embeddings, crop_meta = embed_output_queue.get(timeout=1.0)
-                    print(f"DEBUG_PUT: got response, result_id={result_id}, request_id={request_id}, match={result_id == request_id}", flush=True)
                     if result_id == request_id:
                         precomputed_embeddings = embeddings
                         precomputed_crop_meta = crop_meta
                         logger.info(f"Shared embedder: got {len(embeddings)} embeddings back")
                 except (queue.Empty, queue.Full) as e:
                     logger.warning(f"Shared embedder timeout/error for camera {cam_id}: {e}")
-
-        print(f"DEBUG_EMBED_RESULT: precomputed={precomputed_embeddings is not None}, timeout_log_seen={not not precomputed_embeddings}", flush=True)
 
         annotated = process_frame(
             frame=frame,

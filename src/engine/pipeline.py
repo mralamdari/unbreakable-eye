@@ -1329,6 +1329,8 @@ def embedder_worker(
                 except (queue.Empty, queue.Full) as e:
                     logger.warning(f"Shared embedder timeout/error for camera {cam_id}: {e}")
 
+        print(f"DEBUG_EMBED_RESULT: precomputed={precomputed_embeddings is not None}, timeout_log_seen={not not precomputed_embeddings}", flush=True)
+
         annotated = process_frame(
             frame=frame,
             display_frame=render_frame,

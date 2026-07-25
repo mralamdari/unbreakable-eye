@@ -36,6 +36,7 @@ def shared_embedder_worker(
     routes embeddings back to each camera's embedder_worker.
     """
     pin_process([4,5])
+    print(f"DEBUG_EMBED: shared_embedder_worker started, queue={embed_input_queue}", flush=True)
     embedder_session = create_session(settings.FEATURE_EXTRACTOR_MODEL, num_threads=2)
     logger.info("Shared embedding worker started with single OSNet session")
 
@@ -1293,6 +1294,7 @@ def embedder_worker(
         # Extract crops for embedding (before calling process_frame)
         precomputed_embeddings = None
         precomputed_crop_meta = None
+        print(f"DEBUG_EMBED: run_embedding={run_embedding}, in_q={embed_input_queue is not None}, out_q={embed_output_queue is not None}, dets={len(detections) if detections else 0}", flush=True)
         if run_embedding and embed_input_queue is not None and embed_output_queue is not None:
             crops_onnx = []
             crop_meta_list = []

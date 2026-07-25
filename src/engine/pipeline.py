@@ -1314,6 +1314,7 @@ def embedder_worker(
                         int(tracker_id), det_conf))
 
             if crops_onnx:
+                print(f"DEBUG_CROP: sending {len(crops_onnx)} crops for cam {cam_id}", flush=True)
                 logger.info(f"Shared embedder: sending {len(crops_onnx)} crops for cam {cam_id}")
                 # Send crops to shared embedding worker
                 request_id = f"emb_{cam_id}_{time.time()}"

@@ -52,16 +52,21 @@ def shared_embedder_worker(
 
         # Run batched inference on the crops
         if crops_onnx:
-            batch_input = np.stack(crops_onnx, axis=0)
-            embeddings = embedder_session.run(None, {"input": batch_input})[0]
+            try:
+                batch_input = np.stack(crops_onnx, axis=0)
+                embeddings = embedder_session.run(None, {"input": batch_input})[0]
+                logger.info(f"Shared embedder: inferred {len(embeddings)} embeddings for cam {cam_id}")
+            except Exception as e:
+                logger.error(f"Shared embedder inference failed for cam {cam_id}: {e}", exc_info=True)
+                embeddings = np.array([])
         else:
             embeddings = np.array([])
 
         # Send results back to the requesting camera's embedder
         try:
             embed_output_queues[cam_id].put_nowait((request_id, embeddings, crop_meta))
-        except queue.Full:
-            logger.warning(f"Embed output queue full for camera {cam_id}, dropping results")
+        except Exception as e:
+            logger.warning(f"Embed output queue error for camera {cam_id}: {e}")
             continue
 
     logger.info("Shared embedding worker stopped")
@@ -1320,8 +1325,10 @@ def embedder_worker(
                 request_id = f"emb_{cam_id}_{time.time()}"
                 try:
                     embed_input_queue.put_nowait((request_id, cam_id, crops_onnx, crop_meta_list))
+                    print(f"DEBUG_PUT: put to queue OK, waiting for response...", flush=True)
                     # Wait for embeddings from shared worker
                     result_id, embeddings, crop_meta = embed_output_queue.get(timeout=1.0)
+                    print(f"DEBUG_PUT: got response, result_id={result_id}, request_id={request_id}, match={result_id == request_id}", flush=True)
                     if result_id == request_id:
                         precomputed_embeddings = embeddings
                         precomputed_crop_meta = crop_meta
